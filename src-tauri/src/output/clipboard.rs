@@ -6,8 +6,15 @@ use super::{OutputMode, TextOutput};
 
 /// Delay after writing to clipboard before simulating paste.
 const CLIPBOARD_SETTLE_MS: u64 = 20;
+/// Delay after paste before restoring the original clipboard, so the paste
+/// has finished reading the clipboard before we overwrite it.
+const CLIPBOARD_RESTORE_DELAY_MS: u64 = 120;
 
-pub struct ClipboardOutput;
+pub struct ClipboardOutput {
+    /// When true, back up the clipboard before pasting and restore it after.
+    /// Used for terminal paste so the user's clipboard isn't clobbered.
+    restore_clipboard: bool,
+}
 
 impl Default for ClipboardOutput {
     fn default() -> Self {
@@ -17,7 +24,15 @@ impl Default for ClipboardOutput {
 
 impl ClipboardOutput {
     pub fn new() -> Self {
-        Self
+        Self {
+            restore_clipboard: false,
+        }
+    }
+
+    /// Create a clipboard output that restores the previous clipboard contents
+    /// after pasting (used for terminal output where we paste transiently).
+    pub fn with_restore(restore_clipboard: bool) -> Self {
+        Self { restore_clipboard }
     }
 }
 
@@ -30,9 +45,17 @@ fn should_auto_paste_after_clipboard(session_type: &str) -> bool {
 impl TextOutput for ClipboardOutput {
     async fn type_text(&self, text: &str) -> Result<(), AppError> {
         let text = text.to_string();
+        let restore_clipboard = self.restore_clipboard;
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let mut clipboard = arboard::Clipboard::new()
                 .map_err(|e| AppError::Output(format!("Failed to access clipboard: {}", e)))?;
+
+            // Back up existing clipboard text so we can restore it after pasting.
+            let backup = if restore_clipboard {
+                clipboard.get_text().ok()
+            } else {
+                None
+            };
 
             clipboard
                 .set_text(&text)
@@ -81,6 +104,23 @@ impl TextOutput for ClipboardOutput {
                 enigo
                     .key(Key::Control, Direction::Release)
                     .map_err(|e| AppError::Output(format!("Key release error: {:?}", e)))?;
+            }
+
+            // Restore the original clipboard contents after the paste completes.
+            // The delay ensures the destination app has finished reading the
+            // pasted text before we overwrite the clipboard.
+            if restore_clipboard {
+                std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_RESTORE_DELAY_MS));
+                match backup {
+                    Some(prev) => {
+                        let _ = clipboard.set_text(&prev);
+                    }
+                    None => {
+                        // Original clipboard was empty/unreadable — clear our text
+                        // so we don't leave the dictation lingering on the clipboard.
+                        let _ = clipboard.set_text("");
+                    }
+                }
             }
 
             Ok(())

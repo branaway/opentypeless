@@ -1078,7 +1078,13 @@ impl PipelineHandle {
         let (final_text, llm_elapsed) =
             if config.stt_provider == stt::doubao_audio::DOUBAO_AUDIO_PROVIDER {
                 self.set_state(PipelineState::Outputting);
-                if let Err(e) = self.output_text(&raw_text, &app_ctx.app_name, &config).await {
+                // In a terminal, force clipboard paste so multi-line text is
+                // inserted via bracketed-paste (newlines shown, not executed).
+                let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
+                if let Err(e) = self
+                    .output_text(&raw_text, &app_ctx.app_name, &config, prefer_paste)
+                    .await
+                {
                     tracing::error!("Output failed: {}", e);
                     let _ = self.app_handle.emit("pipeline:error", output_user_error(&e));
                 }
@@ -1200,12 +1206,19 @@ impl PipelineHandle {
         selected_text: Option<String>,
         session_token: String,
     ) -> (String, std::time::Duration) {
+        // In a terminal, force clipboard paste so multi-line text is inserted
+        // via bracketed-paste (newlines shown, not executed as commands).
+        let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
+
         // Check if polish is enabled and API key / token is available
         if !config.polish_enabled
             || (config.llm_api_key.is_empty() && config.llm_provider != "cloud")
         {
             // No polishing — output raw text directly
-            if let Err(e) = self.output_text(raw_text, &app_ctx.app_name, config).await {
+            if let Err(e) = self
+                .output_text(raw_text, &app_ctx.app_name, config, prefer_paste)
+                .await
+            {
                 tracing::error!("Output failed: {}", e);
                 let _ = self
                     .app_handle
@@ -1260,7 +1273,12 @@ impl PipelineHandle {
                     }
                     let elapsed = llm_start.elapsed();
                     if let Err(e) = self
-                        .output_text(&response.polished_text, &app_ctx.app_name, config)
+                        .output_text(
+                            &response.polished_text,
+                            &app_ctx.app_name,
+                            config,
+                            prefer_paste,
+                        )
                         .await
                     {
                         tracing::error!("Output failed: {}", e);
@@ -1282,7 +1300,10 @@ impl PipelineHandle {
                     let _ = self
                         .app_handle
                         .emit("pipeline:error", llm_polish_user_error(&e));
-                    if let Err(e) = self.output_text(raw_text, &app_ctx.app_name, config).await {
+                    if let Err(e) = self
+                        .output_text(raw_text, &app_ctx.app_name, config, prefer_paste)
+                        .await
+                    {
                         tracing::error!("Output failed: {}", e);
                         let _ = self
                             .app_handle
@@ -1334,10 +1355,17 @@ impl PipelineHandle {
         text: &str,
         app_name: &str,
         config: &storage::AppConfig,
+        prefer_paste: bool,
     ) -> Result<()> {
         self.set_state(PipelineState::Outputting);
 
-        let mode = if config.output_mode == "keyboard" {
+        // prefer_paste forces clipboard paste (used for terminals): pasting via
+        // Cmd/Ctrl+V triggers the shell's bracketed-paste mode, so multi-line
+        // text is inserted as a literal block — newlines are shown but NOT run
+        // as separate commands. Keyboard typing would press Enter per newline.
+        let mode = if prefer_paste {
+            OutputMode::Clipboard
+        } else if config.output_mode == "keyboard" {
             OutputMode::Keyboard
         } else {
             OutputMode::Clipboard
@@ -1372,7 +1400,9 @@ impl PipelineHandle {
             mode
         };
 
-        match output::output_with_fallback(&self.app_handle, text, effective_mode).await {
+        match output::output_with_fallback(&self.app_handle, text, effective_mode, prefer_paste)
+            .await
+        {
             Ok(Some(user_error)) => {
                 tracing::info!("Output fell back to clipboard");
                 let _ = self.app_handle.emit("pipeline:warning", &user_error);

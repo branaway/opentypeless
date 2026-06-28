@@ -51,6 +51,9 @@ pub enum AppType {
     Chat,
     Code,
     Document,
+    /// Terminal / shell prompt. Output MUST be single-line: newlines here are
+    /// interpreted as Enter and would split one dictation into several commands.
+    Terminal,
     #[default]
     General,
 }

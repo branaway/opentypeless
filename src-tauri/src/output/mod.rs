@@ -43,9 +43,10 @@ pub async fn output_with_fallback(
     app_handle: &tauri::AppHandle,
     text: &str,
     mode: OutputMode,
+    restore_clipboard: bool,
 ) -> Result<Option<UserError>, String> {
     if mode == OutputMode::Clipboard {
-        let output = create_output(OutputMode::Clipboard, app_handle);
+        let output = clipboard::ClipboardOutput::with_restore(restore_clipboard);
         return output
             .type_text(text)
             .await

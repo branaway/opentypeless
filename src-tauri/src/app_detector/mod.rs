@@ -167,6 +167,14 @@ fn classify_app(app_name: &str) -> AppType {
         .any(|k| name.contains(k))
     {
         AppType::Chat
+    } else if [
+        "terminal", "iterm", "warp", "kitty", "alacritty", "wezterm", "tabby",
+        "hyper", "console", "ghostty",
+    ]
+    .iter()
+    .any(|k| name.contains(k))
+    {
+        AppType::Terminal
     } else if ["code", "intellij", "vim", "nvim", "cursor"]
         .iter()
         .any(|k| name.contains(k))
