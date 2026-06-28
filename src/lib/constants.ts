@@ -71,6 +71,7 @@ export const STT_PROVIDERS: { value: string; labelKey: string }[] = [
   { value: 'deepgram', labelKey: 'providers.stt.deepgram' },
   { value: 'assemblyai', labelKey: 'providers.stt.assemblyai' },
   { value: 'volcengine-doubao', labelKey: 'providers.stt.volcengineDoubao' },
+  { value: 'doubao-audio', labelKey: 'providers.stt.doubaoAudio' },
   { value: 'glm-asr', labelKey: 'providers.stt.glmAsr' },
   { value: 'openai-whisper', labelKey: 'providers.stt.openaiWhisper' },
   { value: 'groq-whisper', labelKey: 'providers.stt.groqWhisper' },

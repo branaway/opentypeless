@@ -424,6 +424,7 @@
       "deepgram": "Deepgram Nova-3",
       "assemblyai": "AssemblyAI",
       "volcengineDoubao": "火山引擎豆包实时语音识别",
+      "doubaoAudio": "豆包 Seed 2.0（音频原生，转写+润色一步完成）",
       "glmAsr": "智谱 GLM-ASR",
       "openaiWhisper": "OpenAI Whisper",
       "groqWhisper": "Groq Whisper",

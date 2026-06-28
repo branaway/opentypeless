@@ -2,6 +2,7 @@ pub mod assemblyai;
 pub mod cloud;
 pub mod config;
 pub mod deepgram;
+pub mod doubao_audio;
 pub mod volcengine;
 pub mod whisper_compat;
 
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
+use doubao_audio::DoubaoAudioConfig;
 use whisper_compat::{WhisperCompatConfig, WhisperCompatProvider};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +57,7 @@ pub trait SttProvider: Send + Sync {
 pub fn create_provider(
     provider_name: &str,
     custom_whisper_config: Option<WhisperCompatConfig>,
+    doubao_audio_config: Option<DoubaoAudioConfig>,
     client: Option<reqwest::Client>,
 ) -> Result<Box<dyn SttProvider>, AppError> {
     match provider_name {
@@ -72,6 +75,15 @@ pub fn create_provider(
         "deepgram" => Ok(Box::new(deepgram::DeepgramProvider::new())),
         volcengine::VOLCENGINE_DOUBAO_PROVIDER => {
             Ok(Box::new(volcengine::VolcengineDoubaoProvider::new()))
+        }
+        doubao_audio::DOUBAO_AUDIO_PROVIDER => {
+            let cfg = doubao_audio_config.ok_or_else(|| {
+                AppError::Config(
+                    "Doubao Audio provider is missing API key or system prompt".to_string(),
+                )
+            })?;
+            let c = client.unwrap_or_default();
+            Ok(Box::new(doubao_audio::DoubaoAudioProvider::new(cfg, c)))
         }
         config::CUSTOM_WHISPER_PROVIDER => {
             let wc = custom_whisper_config.ok_or_else(|| {
@@ -101,7 +113,7 @@ mod tests {
 
     #[test]
     fn custom_whisper_requires_explicit_config() {
-        let result = create_provider(config::CUSTOM_WHISPER_PROVIDER, None, None);
+        let result = create_provider(config::CUSTOM_WHISPER_PROVIDER, None, None, None);
         assert!(result.is_err());
     }
 
@@ -113,19 +125,39 @@ mod tests {
         )
         .unwrap();
 
-        let provider = create_provider(config::CUSTOM_WHISPER_PROVIDER, Some(cfg), None).unwrap();
+        let provider =
+            create_provider(config::CUSTOM_WHISPER_PROVIDER, Some(cfg), None, None).unwrap();
         assert_eq!(provider.name(), config::CUSTOM_WHISPER_PROVIDER);
     }
 
     #[test]
     fn creates_volcengine_doubao_realtime_provider() {
-        let provider = create_provider("volcengine-doubao", None, None).unwrap();
+        let provider = create_provider("volcengine-doubao", None, None, None).unwrap();
         assert_eq!(provider.name(), "Volcengine Doubao Realtime ASR");
     }
 
     #[test]
+    fn doubao_audio_requires_explicit_config() {
+        let result = create_provider(doubao_audio::DOUBAO_AUDIO_PROVIDER, None, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn doubao_audio_uses_explicit_config() {
+        let cfg = doubao_audio::DoubaoAudioConfig {
+            api_key: "test-key".to_string(),
+            model: doubao_audio::DOUBAO_AUDIO_MODEL.to_string(),
+            base_url: doubao_audio::ARK_BASE_URL.to_string(),
+            system_prompt: "You are a test assistant.".to_string(),
+        };
+        let provider =
+            create_provider(doubao_audio::DOUBAO_AUDIO_PROVIDER, None, Some(cfg), None).unwrap();
+        assert_eq!(provider.name(), "Doubao Audio (transcribe + polish)");
+    }
+
+    #[test]
     fn unknown_stt_provider_returns_error() {
-        let result = create_provider("not-a-provider", None, None);
+        let result = create_provider("not-a-provider", None, None, None);
         assert!(result.is_err());
     }
 }

@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::app_detector;
 use crate::audio::{AudioCaptureHandle, AudioConfig};
-use crate::llm::{self, LlmConfig, PolishRequest};
+use crate::llm::{self, prompt as llm_prompt, LlmConfig, PolishRequest};
 use crate::output::{self, OutputMode};
 use crate::storage;
 use crate::stt::{self, SttConfig, TranscriptEvent};
@@ -492,10 +492,11 @@ impl PipelineHandle {
             .preloaded_config
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(config_data.clone());
+        let app_ctx = app_detector::detect_current_app();
         *self
             .preloaded_app_ctx
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(app_detector::detect_current_app());
+            .unwrap_or_else(|e| e.into_inner()) = Some(app_ctx.clone());
         let dict_words = self
             .app_handle
             .state::<storage::DictionaryStore>()
@@ -504,7 +505,7 @@ impl PipelineHandle {
         *self
             .preloaded_dictionary
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(dict_words);
+            .unwrap_or_else(|e| e.into_inner()) = Some(dict_words.clone());
 
         tracing::debug!(
             "Pipeline using config: stt_provider={}, stt_key_len={}, stt_lang={}",
@@ -566,6 +567,28 @@ impl PipelineHandle {
                 None
             };
 
+        // Build Doubao audio config when the audio-native provider is selected.
+        // The system prompt is pre-built here so the app context and dictionary
+        // are baked in before recording starts — no extra round-trip on disconnect.
+        let doubao_audio_config =
+            if config_data.stt_provider == stt::doubao_audio::DOUBAO_AUDIO_PROVIDER {
+                let system_prompt = llm_prompt::build_audio_system_prompt(
+                    app_ctx.app_type,
+                    &dict_words,
+                    &config_data.polish_custom_prompt,
+                    config_data.translate_enabled,
+                    &config_data.target_lang,
+                );
+                Some(stt::doubao_audio::DoubaoAudioConfig {
+                    api_key: config_data.stt_api_key.clone(),
+                    model: stt::doubao_audio::DOUBAO_AUDIO_MODEL.to_string(),
+                    base_url: stt::doubao_audio::ARK_BASE_URL.to_string(),
+                    system_prompt,
+                })
+            } else {
+                None
+            };
+
         // P0-3: Pre-connect STT provider before spawning task
         let stt_api_key = if config_data.stt_provider == "cloud" {
             self.app_handle
@@ -600,6 +623,7 @@ impl PipelineHandle {
         let mut provider = match stt::create_provider(
             &config_data.stt_provider,
             custom_whisper_config,
+            doubao_audio_config,
             Some(self.shared_client.clone()),
         ) {
             Ok(provider) => provider,
@@ -1049,16 +1073,27 @@ impl PipelineHandle {
         }
 
         // ── Phase 2: LLM polish + output ───────────────────────────────
-        let (final_text, llm_elapsed) = self
-            .polish_text(
-                &raw_text,
-                &config,
-                &app_ctx,
-                dictionary_words,
-                selected_text,
-                session_token,
-            )
-            .await;
+        // Doubao audio provider returns already-polished text from disconnect(),
+        // so we skip the LLM step and output directly.
+        let (final_text, llm_elapsed) =
+            if config.stt_provider == stt::doubao_audio::DOUBAO_AUDIO_PROVIDER {
+                self.set_state(PipelineState::Outputting);
+                if let Err(e) = self.output_text(&raw_text, &app_ctx.app_name, &config).await {
+                    tracing::error!("Output failed: {}", e);
+                    let _ = self.app_handle.emit("pipeline:error", output_user_error(&e));
+                }
+                (raw_text.clone(), std::time::Duration::ZERO)
+            } else {
+                self.polish_text(
+                    &raw_text,
+                    &config,
+                    &app_ctx,
+                    dictionary_words,
+                    selected_text,
+                    session_token,
+                )
+                .await
+            };
 
         // ── Phase 3: Timing, history, cleanup ──────────────────────────
         let total_elapsed = stop_start.elapsed();
@@ -1369,6 +1404,9 @@ impl PipelineHandle {
             "assemblyai" => "https://api.assemblyai.com/v2/transcript".to_string(),
             stt::volcengine::VOLCENGINE_DOUBAO_PROVIDER => {
                 "https://openspeech.bytedance.com/api/v3/sauc/bigmodel_async".to_string()
+            }
+            stt::doubao_audio::DOUBAO_AUDIO_PROVIDER => {
+                format!("{}/chat/completions", stt::doubao_audio::ARK_BASE_URL)
             }
             _ => {
                 tracing::debug!(

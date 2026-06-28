@@ -1,19 +1,18 @@
+import { useEffect } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 import { useAppStore } from '../../stores/appStore'
-import { useAuthStore } from '../../stores/authStore'
 import { saveOnboardingCompleted, updateConfig as saveConfig } from '../../lib/tauri'
 import { OnboardingLayout } from './OnboardingLayout'
 import { WelcomeStep } from './WelcomeStep'
-import { AccountStep } from './AccountStep'
-import { ModeSelectStep } from './ModeSelectStep'
-import { SttSetupStep } from './SttSetupStep'
-import { LlmSetupStep } from './LlmSetupStep'
-import { QuickTestStep } from './QuickTestStep'
+import { DoubaoKeyStep } from './DoubaoKeyStep'
 import { DoneStep } from './DoneStep'
 import { slideRight } from '../../lib/animations'
 
-const TOTAL_STEPS = 7
+const TOTAL_STEPS = 3
+
+const ARK_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+const DOUBAO_MODEL = 'doubao-seed-2-0-lite-260428'
 
 export function Onboarding() {
   const { t } = useTranslation()
@@ -21,68 +20,46 @@ export function Onboarding() {
   const setStep = useAppStore((s) => s.setOnboardingStep)
   const setOnboardingCompleted = useAppStore((s) => s.setOnboardingCompleted)
   const sttTestStatus = useAppStore((s) => s.sttTestStatus)
-  const llmTestStatus = useAppStore((s) => s.llmTestStatus)
-  const onboardingMode = useAppStore((s) => s.onboardingMode)
-  const setOnboardingMode = useAppStore((s) => s.setOnboardingMode)
   const updateConfig = useAppStore((s) => s.updateConfig)
-  const user = useAuthStore((s) => s.user)
+  const config = useAppStore((s) => s.config)
+
+  // Pre-wire Doubao Audio as the provider on mount so the rest of the app
+  // is correctly configured before the user even hits the key step.
+  useEffect(() => {
+    updateConfig({
+      stt_provider: 'doubao-audio',
+      llm_provider: 'doubao',
+      llm_base_url: ARK_BASE_URL,
+      llm_model: DOUBAO_MODEL,
+      polish_enabled: false, // doubao-audio transcribes + polishes in one shot
+    })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const canNext = (() => {
     switch (step) {
-      case 0:
-        return true // Welcome — always
-      case 1:
-        return !!user // Account — need login to Next (Skip to bypass)
-      case 2:
-        return onboardingMode !== null // Mode — need selection
-      case 3:
-        return sttTestStatus === 'success' // STT must pass (BYOK only)
-      case 4:
-        return llmTestStatus === 'success' // LLM must pass (BYOK only)
-      case 5:
-        return true // Quick test — optional
-      case 6:
-        return true // Done
-      default:
-        return false
+      case 0: return true
+      case 1: return sttTestStatus === 'success'
+      case 2: return true
+      default: return false
     }
   })()
 
   const titles = [
     { title: t('onboarding.steps.welcome'), subtitle: t('onboarding.steps.welcomeSub') },
-    { title: t('onboarding.steps.signIn'), subtitle: t('onboarding.steps.signInSub') },
-    { title: t('onboarding.steps.chooseMode'), subtitle: t('onboarding.steps.chooseModeSub') },
     {
-      title: t('onboarding.steps.speechRecognition'),
-      subtitle: t('onboarding.steps.speechRecognitionSub'),
+      title: t('onboarding.doubaoKey.stepTitle', 'ARK API Key'),
+      subtitle: t('onboarding.doubaoKey.stepSubtitle', 'One key for transcription and polishing'),
     },
-    { title: t('onboarding.steps.aiPolish'), subtitle: t('onboarding.steps.aiPolishSub') },
-    { title: t('onboarding.steps.howItWorks'), subtitle: t('onboarding.steps.howItWorksSub') },
     { title: t('onboarding.steps.setupComplete'), subtitle: undefined },
   ]
 
-  const config = useAppStore((s) => s.config)
-
   const handleNext = async () => {
     if (step < TOTAL_STEPS - 1) {
-      // Cloud mode: set providers BEFORE saving, then skip STT/LLM setup
-      if (step === 2 && onboardingMode === 'cloud') {
-        updateConfig({ stt_provider: 'cloud', llm_provider: 'cloud' })
-        try {
-          await saveConfig({ ...config, stt_provider: 'cloud', llm_provider: 'cloud' })
-        } catch {
-          // Best-effort save
-        }
-        setStep(5)
-        return
-      }
-
       try {
         await saveConfig(config)
       } catch {
-        // Best-effort save — continue navigation even if save fails
+        // Best-effort save
       }
-
       setStep(step + 1)
     } else {
       await saveConfig(config)
@@ -98,40 +75,18 @@ export function Onboarding() {
       } catch {
         // Best-effort save
       }
-
-      // If coming back from Quick Test in cloud mode, go back to Mode Select (step 2)
-      if (step === 5 && onboardingMode === 'cloud') {
-        setStep(2)
-        return
-      }
-
-      // If coming back from STT setup and user skipped login, go back to Account (step 1)
-      if (step === 3 && !user) {
-        setStep(1)
-        return
-      }
-
       setStep(step - 1)
     }
   }
 
-  const handleSkip = async () => {
-    if (step === 1) {
-      // Skip login → go straight to BYOK STT setup
-      setOnboardingMode('byok')
-      try {
+  // Skip is only available on Welcome and Done — not the key step
+  const handleSkip = step !== 1
+    ? async () => {
         await saveConfig(config)
-      } catch {
-        // Best-effort save
+        await saveOnboardingCompleted()
+        setOnboardingCompleted(true)
       }
-      setStep(3)
-      return
-    }
-    // Original behavior for other steps — skip entire onboarding
-    await saveConfig(config)
-    await saveOnboardingCompleted()
-    setOnboardingCompleted(true)
-  }
+    : undefined
 
   return (
     <OnboardingLayout
@@ -158,12 +113,8 @@ export function Onboarding() {
           transition={{ duration: 0.2 }}
         >
           {step === 0 && <WelcomeStep />}
-          {step === 1 && <AccountStep />}
-          {step === 2 && <ModeSelectStep />}
-          {step === 3 && <SttSetupStep />}
-          {step === 4 && <LlmSetupStep />}
-          {step === 5 && <QuickTestStep />}
-          {step === 6 && <DoneStep />}
+          {step === 1 && <DoubaoKeyStep />}
+          {step === 2 && <DoneStep />}
         </motion.div>
       </AnimatePresence>
     </OnboardingLayout>

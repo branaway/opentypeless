@@ -105,6 +105,10 @@ pub fn stt_provider_requires_api_key(provider: &str) -> bool {
     !matches!(provider, "cloud" | CUSTOM_WHISPER_PROVIDER)
 }
 
+pub fn stt_provider_is_batch(provider: &str) -> bool {
+    matches!(provider, super::doubao_audio::DOUBAO_AUDIO_PROVIDER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

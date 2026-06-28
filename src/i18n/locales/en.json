@@ -424,6 +424,7 @@
       "deepgram": "Deepgram Nova-3",
       "assemblyai": "AssemblyAI",
       "volcengineDoubao": "Volcengine Doubao Realtime ASR",
+      "doubaoAudio": "Doubao Seed 2.0 (Audio Native, transcribe + polish)",
       "glmAsr": "GLM-ASR (Zhipu)",
       "openaiWhisper": "OpenAI Whisper",
       "groqWhisper": "Groq Whisper",

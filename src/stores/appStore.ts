@@ -6,6 +6,7 @@ export type SttProvider =
   | 'deepgram'
   | 'assemblyai'
   | 'volcengine-doubao'
+  | 'doubao-audio'
   | 'glm-asr'
   | 'openai-whisper'
   | 'groq-whisper'
@@ -182,7 +183,7 @@ export const isMacPlatform = () =>
   typeof navigator !== 'undefined' && navigator.platform.toUpperCase().indexOf('MAC') >= 0
 
 const defaultConfig: AppConfig = {
-  stt_provider: 'glm-asr',
+  stt_provider: 'doubao-audio',
   stt_api_key: '',
   stt_custom_api_key: '',
   stt_custom_preset: 'speaches',
@@ -190,17 +191,17 @@ const defaultConfig: AppConfig = {
   stt_custom_model: 'Systran/faster-whisper-large-v3',
   stt_volcengine_resource_id: 'volc.seedasr.sauc.duration',
   stt_language: 'multi',
-  llm_provider: 'openrouter',
+  llm_provider: 'doubao',
   llm_api_key: '',
-  llm_model: 'google/gemini-2.5-flash',
-  llm_base_url: 'https://openrouter.ai/api/v1',
-  polish_enabled: true,
+  llm_model: 'doubao-seed-2-0-lite-260428',
+  llm_base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+  polish_enabled: false,
   polish_custom_prompt: '',
   polish_chinese_script: 'preserve',
   translate_enabled: false,
   target_lang: 'en',
   hotkey: isMacPlatform() ? 'Option+/' : 'Ctrl+/',
-  hotkey_mode: 'hold',
+  hotkey_mode: 'toggle',
   output_mode: 'keyboard',
   selected_text_enabled: false,
   theme: 'system',
