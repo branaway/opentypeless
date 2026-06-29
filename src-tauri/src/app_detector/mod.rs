@@ -168,8 +168,16 @@ fn classify_app(app_name: &str) -> AppType {
     {
         AppType::Chat
     } else if [
-        "terminal", "iterm", "warp", "kitty", "alacritty", "wezterm", "tabby",
-        "hyper", "console", "ghostty",
+        "terminal",
+        "iterm",
+        "warp",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "tabby",
+        "hyper",
+        "console",
+        "ghostty",
     ]
     .iter()
     .any(|k| name.contains(k))

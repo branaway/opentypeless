@@ -4,8 +4,9 @@ export type Route = 'home' | 'settings' | 'history' | 'upgrade' | 'account'
 
 function parseHash(): Route {
   const hash = window.location.hash.replace('#/', '')
-  if (hash === 'settings' || hash === 'history' || hash === 'upgrade' || hash === 'account')
-    return hash
+  // Settings supports an optional sub-pane segment, e.g. "settings/usage".
+  if (hash === 'settings' || hash.startsWith('settings/')) return 'settings'
+  if (hash === 'history' || hash === 'upgrade' || hash === 'account') return hash
   return 'home'
 }
 

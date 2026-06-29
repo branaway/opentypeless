@@ -8,6 +8,7 @@ import { SttPane } from './SttPane'
 import { LlmPane } from './LlmPane'
 import { DictionaryPane } from './DictionaryPane'
 import { ScenesPane } from './ScenesPane'
+import { UsagePane } from './UsagePane'
 import { AboutPane } from './AboutPane'
 import { DirtyBar, useDirtyConfig } from './shared/DirtyBar'
 
@@ -17,11 +18,19 @@ const paneTitleKeys: Record<PaneId, string> = {
   llm: 'settings.aiPolish',
   dictionary: 'settings.dictionary',
   scenes: 'settings.scenes',
+  usage: 'settings.usage',
   about: 'settings.about',
 }
 
+const VALID_PANES: PaneId[] = ['general', 'stt', 'llm', 'dictionary', 'scenes', 'usage', 'about']
+
+function paneFromHash(): PaneId {
+  const seg = window.location.hash.replace(/^#\/settings\/?/, '')
+  return (VALID_PANES as string[]).includes(seg) ? (seg as PaneId) : 'general'
+}
+
 export function Settings() {
-  const [activePane, setActivePane] = useState<PaneId>('general')
+  const [activePane, setActivePane] = useState<PaneId>(paneFromHash)
   const config = useAppStore((s) => s.config)
   const setSavedConfig = useAppStore((s) => s.setSavedConfig)
   const isDirty = useDirtyConfig()
@@ -31,6 +40,13 @@ export function Settings() {
   useEffect(() => {
     setSavedConfig(config)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Honor deep links to a specific pane (e.g. #/settings/usage from the capsule).
+  useEffect(() => {
+    const onHash = () => setActivePane(paneFromHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
   return (
     <div className="w-full h-full bg-bg-primary text-text-primary flex flex-col">
@@ -61,6 +77,7 @@ export function Settings() {
                 {activePane === 'llm' && <LlmPane />}
                 {activePane === 'dictionary' && <DictionaryPane />}
                 {activePane === 'scenes' && <ScenesPane />}
+                {activePane === 'usage' && <UsagePane />}
                 {activePane === 'about' && <AboutPane />}
               </motion.div>
             </AnimatePresence>

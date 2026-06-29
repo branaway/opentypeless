@@ -36,6 +36,18 @@ pub struct AppConfig {
     pub max_recording_seconds: u32,
     pub ui_language: String,
     pub capsule_auto_hide: bool,
+    /// When true, the polished result is shown in an editable preview before
+    /// being output to the target app, instead of being typed/pasted directly.
+    pub preview_before_output: bool,
+    /// When true, short audio cues play on pipeline state transitions
+    /// (listening, transcribing, polishing, output).
+    pub sound_effects_enabled: bool,
+    /// When true, a single Enter is pressed after the text is output, so the
+    /// result is submitted (e.g. runs in a terminal) without a manual keypress.
+    pub output_append_enter: bool,
+    /// When true, long silent gaps are collapsed before audio upload to cut
+    /// audio-token cost (audio is billed purely by duration).
+    pub trim_silence: bool,
 }
 
 impl Default for AppConfig {
@@ -73,6 +85,10 @@ impl Default for AppConfig {
             max_recording_seconds: 30,
             ui_language: "en".to_string(),
             capsule_auto_hide: false,
+            preview_before_output: true,
+            sound_effects_enabled: true,
+            output_append_enter: true,
+            trim_silence: true,
         }
     }
 }
@@ -267,6 +283,130 @@ impl HistoryStore {
     pub async fn clear(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM history", [])?;
+        Ok(())
+    }
+}
+
+// ─── UsageStore (SQLite backed) — token-usage cost auditing ───
+
+/// Doubao pricing, RMB (元) per 1,000,000 tokens. Source: model pricing page
+/// (推理输入 0.6 · 音频输入 9 · 推理输出 3.6, 输入 ≤32k). Cost is computed and
+/// frozen into each row at record time, so historical totals stay correct even
+/// if these prices change later.
+const PRICE_AUDIO_IN_PER_M: f64 = 9.0;
+const PRICE_TEXT_IN_PER_M: f64 = 0.6;
+const PRICE_TEXT_OUT_PER_M: f64 = 3.6;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UsageSummary {
+    /// Total spend (元) across all recorded events.
+    pub total_cost: f64,
+    /// Spend (元) since the start of the current local-calendar month.
+    pub month_cost: f64,
+    /// Spend (元) since local midnight today.
+    pub today_cost: f64,
+    pub total_calls: i64,
+    pub audio_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// ISO 4217 code for the amounts above (always "CNY" for now).
+    pub currency: String,
+}
+
+pub struct UsageStore {
+    conn: Mutex<Connection>,
+}
+
+impl UsageStore {
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '',
+                audio_tokens INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost REAL NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Cost (元) for a token breakdown, using the fixed Doubao prices above.
+    pub fn cost_for(audio_tokens: i64, input_tokens: i64, output_tokens: i64) -> f64 {
+        audio_tokens as f64 * PRICE_AUDIO_IN_PER_M / 1_000_000.0
+            + input_tokens as f64 * PRICE_TEXT_IN_PER_M / 1_000_000.0
+            + output_tokens as f64 * PRICE_TEXT_OUT_PER_M / 1_000_000.0
+    }
+
+    /// Record one billable API call. Never fails the caller — a usage write must
+    /// not disrupt the recording pipeline, so errors are logged and swallowed.
+    pub fn record(&self, model: &str, kind: &str, audio: i64, input: i64, output: i64) {
+        let cost = Self::cost_for(audio, input, output);
+        let created_at = chrono::Local::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = conn.execute(
+            "INSERT INTO usage_events (created_at, model, kind, audio_tokens, input_tokens, output_tokens, cost)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![created_at, model, kind, audio, input, output, cost],
+        ) {
+            tracing::warn!("Failed to record usage event: {}", e);
+        }
+    }
+
+    pub fn summary(&self) -> Result<UsageSummary> {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        let to_millis = |d: chrono::NaiveDate| -> i64 {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|ndt| ndt.and_local_timezone(chrono::Local).single())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0)
+        };
+        let today_start = to_millis(today);
+        let month_start = to_millis(today.with_day(1).unwrap_or(today));
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let sum_since = |since: i64| -> Result<f64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(SUM(cost), 0) FROM usage_events WHERE created_at >= ?1",
+                rusqlite::params![since],
+                |r| r.get(0),
+            )?)
+        };
+        let total_cost: f64 =
+            conn.query_row("SELECT COALESCE(SUM(cost), 0) FROM usage_events", [], |r| {
+                r.get(0)
+            })?;
+        let (total_calls, audio_tokens, input_tokens, output_tokens): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(audio_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM usage_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+
+        Ok(UsageSummary {
+            total_cost,
+            month_cost: sum_since(month_start)?,
+            today_cost: sum_since(today_start)?,
+            total_calls,
+            audio_tokens,
+            input_tokens,
+            output_tokens,
+            currency: "CNY".to_string(),
+        })
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM usage_events", [])?;
         Ok(())
     }
 }

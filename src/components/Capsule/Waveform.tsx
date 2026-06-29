@@ -28,11 +28,12 @@ export function Waveform() {
     const animate = () => {
       const raw = useAppStore.getState().audioVolume
 
-      // dB scale calibrated so background noise stays near the floor and only
-      // real speech drives the bars. -40 dB (RMS ~0.01) maps to 0, -12 dB
-      // (RMS ~0.25, loud speech) maps to 1.
+      // dB scale calibrated so background noise stays near the floor while
+      // normal speech clearly drives the bars. -45 dB (RMS ~0.0056, aligned
+      // with the voice-edit VAD threshold) maps to 0, -18 dB (RMS ~0.13,
+      // ordinary speaking volume) maps to 1.
       const db = 20 * Math.log10(Math.max(raw, 0.0001))
-      const target = Math.max(0, Math.min(1, (db + 40) / 28))
+      const target = Math.max(0, Math.min(1, (db + 45) / 27))
 
       // Smooth attack (fast) / decay (slower) so bars snap up but glide down
       const prev = smoothed.current

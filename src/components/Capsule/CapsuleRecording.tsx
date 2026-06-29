@@ -2,12 +2,14 @@ import { useTranslation } from 'react-i18next'
 import { motion, useReducedMotion } from 'framer-motion'
 import { X } from 'lucide-react'
 import { abortRecording } from '../../lib/tauri'
+import { useAppStore } from '../../stores/appStore'
 import { Waveform } from './Waveform'
 import { DurationTimer } from './DurationTimer'
 
 export function CapsuleRecording() {
   const { t } = useTranslation()
   const reduced = useReducedMotion()
+  const progress = useAppStore((s) => s.recordingProgress)
 
   const handleCancel = async (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -42,6 +44,21 @@ export function CapsuleRecording() {
       >
         <X size={12} />
       </button>
+
+      {/* Implicit budget progress: a subtle line along the bottom that fills as
+          voiced time approaches the max recording duration. Turns amber near
+          the limit so the user notices they're running out. */}
+      <div
+        className="absolute bottom-[2px] left-3 right-3 h-[2px] rounded-full bg-white/10 overflow-hidden pointer-events-none"
+        aria-hidden
+      >
+        <div
+          className={`h-full rounded-full transition-[width] duration-300 ease-linear ${
+            progress > 0.85 ? 'bg-amber-300/80' : 'bg-white/45'
+          }`}
+          style={{ width: `${Math.min(100, progress * 100)}%` }}
+        />
+      </div>
     </motion.div>
   )
 }

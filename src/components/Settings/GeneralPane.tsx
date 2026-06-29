@@ -306,6 +306,9 @@ export function GeneralPane() {
             {config.max_recording_seconds}s
           </span>
         </div>
+        <p className="text-[11px] text-text-tertiary mt-2">
+          {t('settings.maxRecordingDurationHint')}
+        </p>
       </Section>
 
       <Section title={t('settings.other')}>
@@ -327,6 +330,32 @@ export function GeneralPane() {
             onChange={(checked) => updateConfig({ capsule_auto_hide: checked })}
             label={t('settings.hideCapsuleWhenIdle')}
           />
+          <Toggle
+            checked={config.preview_before_output}
+            onChange={(checked) => updateConfig({ preview_before_output: checked })}
+            label={t('settings.previewBeforeOutput')}
+          />
+          <p className="text-[11px] text-text-tertiary -mt-1.5">
+            {t('settings.previewBeforeOutputHint')}
+          </p>
+          <Toggle
+            checked={config.sound_effects_enabled}
+            onChange={(checked) => updateConfig({ sound_effects_enabled: checked })}
+            label={t('settings.soundEffects')}
+          />
+          <p className="text-[11px] text-text-tertiary -mt-1.5">{t('settings.soundEffectsHint')}</p>
+          <Toggle
+            checked={config.output_append_enter}
+            onChange={(checked) => updateConfig({ output_append_enter: checked })}
+            label={t('settings.appendEnter')}
+          />
+          <p className="text-[11px] text-text-tertiary -mt-1.5">{t('settings.appendEnterHint')}</p>
+          <Toggle
+            checked={config.trim_silence}
+            onChange={(checked) => updateConfig({ trim_silence: checked })}
+            label={t('settings.trimSilence')}
+          />
+          <p className="text-[11px] text-text-tertiary -mt-1.5">{t('settings.trimSilenceHint')}</p>
         </div>
       </Section>
     </div>

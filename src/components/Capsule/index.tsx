@@ -7,8 +7,8 @@ import { CapsuleIdle } from './CapsuleIdle'
 import { CapsuleRecording } from './CapsuleRecording'
 import { CapsuleProcessing } from './CapsuleProcessing'
 import { CapsulePolishing } from './CapsulePolishing'
-import { CapsuleComplete } from './CapsuleComplete'
 import { CapsuleError } from './CapsuleError'
+import { CapsulePreviewing } from './CapsulePreviewing'
 import { CapsuleContextMenu } from './CapsuleContextMenu'
 
 const DRAG_THRESHOLD = 5
@@ -120,7 +120,7 @@ export function Capsule() {
             {capsuleState === 'recording' && <CapsuleRecording />}
             {capsuleState === 'transcribing' && <CapsuleProcessing />}
             {capsuleState === 'polishing' && <CapsulePolishing />}
-            {capsuleState === 'outputting' && <CapsuleComplete />}
+            {capsuleState === 'previewing' && <CapsulePreviewing />}
             {capsuleState === 'error' && <CapsuleError />}
           </motion.div>
         </AnimatePresence>

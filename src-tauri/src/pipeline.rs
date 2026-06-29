@@ -1,7 +1,7 @@
 use anyhow::Result;
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings as EnigoSettings};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -122,6 +122,14 @@ const CLIPBOARD_COPY_SETTLE_MS: u64 = 100;
 const VOLUME_POLL_INTERVAL_MS: u64 = 50;
 /// Timeout for STT finalization after recording stops.
 const STT_FINALIZE_TIMEOUT_SECS: u64 = 120;
+/// Delay before outputting a confirmed preview, so the hotkey's modifier keys
+/// (e.g. Option) are fully released before we simulate paste/keystrokes —
+/// otherwise the synthesized Cmd+V collides with the held modifier (beep, no
+/// paste). Mirrors SELECTED_TEXT_CAPTURE_DELAY_MS in stop().
+const PREVIEW_CONFIRM_OUTPUT_DELAY_MS: u64 = 150;
+/// Delay between the text landing and the optional trailing Enter, so the paste
+/// (or typing) is fully committed in the target app before we submit it.
+const APPEND_ENTER_DELAY_MS: u64 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +139,10 @@ pub enum PipelineState {
     Transcribing,
     Polishing,
     Outputting,
+    /// Polished text is held in an editable preview, awaiting the user's
+    /// confirm (output), voice edit, or cancel. Only reached when the
+    /// `preview_before_output` setting is enabled.
+    Previewing,
 }
 
 impl PipelineState {
@@ -141,6 +153,7 @@ impl PipelineState {
             Self::Transcribing => 2,
             Self::Polishing => 3,
             Self::Outputting => 4,
+            Self::Previewing => 5,
         }
     }
 
@@ -150,6 +163,7 @@ impl PipelineState {
             2 => Self::Transcribing,
             3 => Self::Polishing,
             4 => Self::Outputting,
+            5 => Self::Previewing,
             _ => Self::Idle,
         }
     }
@@ -160,6 +174,225 @@ struct SttTaskControl {
     id: u64,
     done: Arc<Notify>,
     abort: Arc<Notify>,
+}
+
+/// Everything needed to finish a recording (output + history) once the user
+/// confirms an editable preview. Captured when the pipeline enters Previewing.
+#[derive(Clone)]
+struct PreviewContext {
+    raw_text: String,
+    app_ctx: app_detector::AppContext,
+    config: storage::AppConfig,
+    dictionary: Vec<String>,
+    duration_ms: Option<i64>,
+    stt_ms: u64,
+    llm_ms: u64,
+}
+
+// ─── Voice-edit (preview command listening) tuning ───
+/// Normalized RMS (0..1) above which a 20ms chunk counts as speech.
+/// ~0.008 ≈ -42 dBFS — low enough for normal/quiet mics (was 0.02, which
+/// required shouting on lower-gain inputs). Raise if background noise triggers.
+const VAD_SPEECH_RMS: f32 = 0.008;
+/// Minimum cumulative speech before an utterance is considered real (anti-noise).
+const VAD_MIN_SPEECH_MS: u64 = 250;
+/// Trailing silence after speech that ends an utterance. 1.5s gives the user a
+/// little extra thinking time mid-command before it's treated as finished.
+const VAD_SILENCE_HANGOVER_MS: u64 = 1500;
+/// Hard cap on a single utterance so a stuck VAD can't buffer forever.
+const VAD_MAX_UTTERANCE_MS: u64 = 20_000;
+
+/// Normalized RMS (0..1) of a little-endian i16 PCM chunk.
+fn chunk_rms_norm(bytes: &[u8]) -> f32 {
+    if bytes.len() < 2 {
+        return 0.0;
+    }
+    let mut sum_sq = 0.0f64;
+    let mut n = 0u64;
+    for pair in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]) as f64;
+        sum_sq += s * s;
+        n += 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    ((sum_sq / n as f64).sqrt() / 32768.0) as f32
+}
+
+/// Marker characters stripped from model output: the primary cursor marker plus
+/// the legacy bracket glyphs the model used to wrap inserted text with, so none
+/// of them ever leak into the result even if the model regresses.
+const MARKER_CHARS: [char; 3] = ['‸', '⟦', '⟧'];
+
+/// Remove the cursor marker from model output and return (clean_text, caret),
+/// where caret is the Unicode-scalar offset of the (first) marker in the CLEANED
+/// text. Any extra/stray marker glyphs the model may have emitted are stripped
+/// too. If no marker is present, the caret defaults to the end of the text.
+fn extract_cursor_marker(text: &str) -> (String, usize) {
+    debug_assert!(MARKER_CHARS.contains(
+        &stt::doubao_audio::CURSOR_MARKER
+            .chars()
+            .next()
+            .unwrap_or('‸')
+    ));
+    let clean: String = text.chars().filter(|c| !MARKER_CHARS.contains(c)).collect();
+    match text.char_indices().find(|(_, c)| MARKER_CHARS.contains(c)) {
+        // Caret = number of non-marker chars before the first marker.
+        Some((byte_idx, _)) => {
+            let caret = text[..byte_idx]
+                .chars()
+                .filter(|c| !MARKER_CHARS.contains(c))
+                .count();
+            (clean, caret)
+        }
+        None => {
+            let caret = clean.chars().count();
+            (clean, caret)
+        }
+    }
+}
+
+/// Continuous voice-edit loop for the preview. Segments spoken commands with a
+/// simple energy VAD; each finalized utterance is sent (with the current text)
+/// to the audio model, which returns a structured edit/send/rerecord action.
+#[allow(clippy::too_many_arguments)]
+async fn run_preview_vad(
+    app_handle: tauri::AppHandle,
+    client: reqwest::Client,
+    mut audio_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    abort: Arc<Notify>,
+    preview_text: Arc<Mutex<String>>,
+    state: Arc<AtomicU8>,
+    api_key: String,
+    model: String,
+    base_url: String,
+    system_prompt: String,
+    preview_caret: Arc<AtomicUsize>,
+) {
+    let chunk_ms = AudioConfig::default().chunk_duration_ms as u64;
+    let mut utterance: Vec<u8> = Vec::new();
+    let mut in_speech = false;
+    let mut speech_ms: u64 = 0;
+    let mut silence_ms: u64 = 0;
+    let mut utter_ms: u64 = 0;
+
+    loop {
+        if PipelineState::from_u8(state.load(Ordering::SeqCst)) != PipelineState::Previewing {
+            break;
+        }
+
+        let chunk = tokio::select! {
+            _ = abort.notified() => break,
+            chunk = audio_rx.recv() => match chunk {
+                Some(c) => c,
+                None => break,
+            },
+        };
+
+        // Drive the capsule waveform with the live mic level.
+        let rms = chunk_rms_norm(&chunk);
+        let _ = app_handle.emit("audio:volume", rms);
+
+        let is_speech = rms >= VAD_SPEECH_RMS;
+        if is_speech {
+            in_speech = true;
+            speech_ms += chunk_ms;
+            silence_ms = 0;
+            utterance.extend_from_slice(&chunk);
+            utter_ms += chunk_ms;
+        } else if in_speech {
+            silence_ms += chunk_ms;
+            utterance.extend_from_slice(&chunk);
+            utter_ms += chunk_ms;
+        } else {
+            // Not speaking: keep listening indefinitely. The preview is an open
+            // editing session and the user may pause to think for a long time, so
+            // the mic is NEVER timed out on silence — it stops only on
+            // confirm/cancel/abort or when the pipeline leaves Previewing.
+            continue;
+        }
+
+        let done = in_speech
+            && speech_ms >= VAD_MIN_SPEECH_MS
+            && (silence_ms >= VAD_SILENCE_HANGOVER_MS || utter_ms >= VAD_MAX_UTTERANCE_MS);
+        if !done {
+            // Abandon a sub-threshold blip: a brief noise spike flips in_speech
+            // but never reaches real speech. Once the hangover of silence passes
+            // without crossing VAD_MIN_SPEECH_MS, treat it as noise — drop the
+            // buffer and reset, so a spike can't keep accumulating silence (and
+            // never gets sent to the backend).
+            if in_speech && speech_ms < VAD_MIN_SPEECH_MS && silence_ms >= VAD_SILENCE_HANGOVER_MS {
+                utterance.clear();
+                in_speech = false;
+                speech_ms = 0;
+                silence_ms = 0;
+                utter_ms = 0;
+            }
+            continue;
+        }
+
+        // Finalize and process this utterance.
+        let audio = std::mem::take(&mut utterance);
+        in_speech = false;
+        speech_ms = 0;
+        silence_ms = 0;
+        utter_ms = 0;
+
+        let current = preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let caret_offset = preview_caret.load(Ordering::SeqCst);
+        let _ = app_handle.emit("preview:thinking", true);
+        let action = stt::doubao_audio::run_edit_action(
+            &client,
+            &api_key,
+            &model,
+            &base_url,
+            &system_prompt,
+            &current,
+            &audio,
+            &app_handle,
+            caret_offset,
+        )
+        .await;
+        let _ = app_handle.emit("preview:thinking", false);
+
+        match action {
+            Ok(stt::doubao_audio::EditAction::Edit(marked)) => {
+                // The model returns the full text with one cursor marker showing
+                // the new caret. Strip it, recover the caret, and sync both.
+                let (clean, caret) = extract_cursor_marker(&marked);
+                *preview_text.lock().unwrap_or_else(|e| e.into_inner()) = clean.clone();
+                preview_caret.store(caret, Ordering::SeqCst);
+                let _ = app_handle.emit("preview:ready", &clean);
+                let _ = app_handle.emit("preview:caret", caret);
+            }
+            Ok(stt::doubao_audio::EditAction::Send) => {
+                let pipeline = app_handle.state::<PipelineHandle>();
+                let _ = pipeline.confirm_preview().await;
+                break;
+            }
+            Ok(stt::doubao_audio::EditAction::Rerecord) => {
+                let pipeline = app_handle.state::<PipelineHandle>();
+                pipeline.rerecord_preview().await;
+                break;
+            }
+            Err(e) => {
+                tracing::error!("Voice edit failed: {}", e);
+                let _ = app_handle.emit("preview:edit_error", e.to_user_error());
+                // Keep listening so the user can retry.
+            }
+        }
+
+        // Discard audio captured during the (blocking) API call.
+        while audio_rx.try_recv().is_ok() {}
+    }
+
+    let _ = app_handle.emit("audio:volume", 0.0f32);
+    let _ = app_handle.emit("preview:listening", false);
 }
 
 fn should_finalize_stt_task(
@@ -282,6 +515,31 @@ fn copy_selected_text_to_clipboard() -> bool {
     pressed
 }
 
+/// Bring the captured target app back to the foreground before output. Clicking
+/// the preview window can steal focus from the app that was active when
+/// recording started; without this, the simulated paste/keystrokes would go to
+/// the wrong window (or nowhere) and the text would be lost.
+#[cfg(target_os = "macos")]
+fn reactivate_app(app_name: &str) {
+    if app_name.trim().is_empty() {
+        return;
+    }
+    let escaped = app_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"tell application "System Events" to set frontmost of (first process whose name is "{}") to true"#,
+        escaped
+    );
+    if let Err(e) = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .status()
+    {
+        tracing::warn!("Failed to reactivate target app '{}': {}", app_name, e);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reactivate_app(_app_name: &str) {}
+
 pub struct PipelineHandle {
     app_handle: tauri::AppHandle,
     state: Arc<AtomicU8>,
@@ -297,6 +555,23 @@ pub struct PipelineHandle {
     preloaded_dictionary: Arc<Mutex<Option<Vec<String>>>>,
     preloaded_selected_text: Arc<Mutex<Option<String>>>,
     recording_start: Arc<Mutex<Option<std::time::Instant>>>,
+    /// One-shot flag: when set during Transcribing/Polishing (via a second
+    /// hotkey press), the in-flight result skips the editable preview and is
+    /// output directly. Reset at the start of every recording and after use.
+    skip_preview_once: Arc<AtomicBool>,
+    /// Cached `sound_effects_enabled` setting, refreshed at the start of every
+    /// recording so the early state beeps (which fire before config is loaded
+    /// in stop()) can be gated without a config read on the hot path.
+    sound_enabled: Arc<AtomicBool>,
+    /// Current editable preview text (valid while state == Previewing).
+    preview_text: Arc<Mutex<String>>,
+    /// Caret position (Unicode scalar offset) where the next voice-dictated
+    /// content is inserted. usize::MAX means "end of text".
+    preview_caret: Arc<AtomicUsize>,
+    /// Context needed to output + save history when the preview is confirmed.
+    preview_ctx: Arc<Mutex<Option<PreviewContext>>>,
+    /// Abort signal for the active voice-edit (command listening) task, if any.
+    preview_cmd_abort: Arc<Mutex<Option<Arc<Notify>>>>,
     shared_client: reqwest::Client,
     /// Serializes start()/stop() so that stop() waits for start() to finish
     /// its setup before reading shared state (preloaded_config, audio_handle, etc.).
@@ -322,6 +597,12 @@ impl PipelineHandle {
             preloaded_dictionary: Arc::new(Mutex::new(None)),
             preloaded_selected_text: Arc::new(Mutex::new(None)),
             recording_start: Arc::new(Mutex::new(None)),
+            skip_preview_once: Arc::new(AtomicBool::new(false)),
+            sound_enabled: Arc::new(AtomicBool::new(true)),
+            preview_text: Arc::new(Mutex::new(String::new())),
+            preview_caret: Arc::new(AtomicUsize::new(usize::MAX)),
+            preview_ctx: Arc::new(Mutex::new(None)),
+            preview_cmd_abort: Arc::new(Mutex::new(None)),
             shared_client,
             pipeline_lock: tokio::sync::Mutex::new(()),
         }
@@ -331,6 +612,13 @@ impl PipelineHandle {
         self.state.store(new_state.as_u8(), Ordering::SeqCst);
         let _ = self.app_handle.emit("pipeline:state", new_state);
 
+        // Returning to Idle ends the session — release the global Escape grab.
+        // Every terminal path (stop, abort, no-speech, confirm/cancel preview)
+        // funnels through here, so this is the single cleanup point.
+        if new_state == PipelineState::Idle {
+            self.unregister_escape();
+        }
+
         // Update tray tooltip + menu to reflect pipeline state
         if let Some(tray_handle) = self.app_handle.try_state::<crate::TrayHandle>() {
             let tooltip = match new_state {
@@ -338,6 +626,7 @@ impl PipelineHandle {
                 PipelineState::Transcribing => "OpenTypeless - Transcribing...",
                 PipelineState::Polishing => "OpenTypeless - Polishing...",
                 PipelineState::Outputting => "OpenTypeless - Outputting...",
+                PipelineState::Previewing => "OpenTypeless - Preview",
                 PipelineState::Idle => "OpenTypeless",
             };
             if let Ok(t) = tray_handle.tray.lock() {
@@ -349,6 +638,47 @@ impl PipelineHandle {
 
     pub fn current_state(&self) -> PipelineState {
         PipelineState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    /// Grab a global Escape shortcut for the duration of an active session so it
+    /// cancels recording/preview instead of leaking to the (still-focused) target
+    /// app. The capsule window is non-focusable, so its in-page Escape handler
+    /// never fires — a global shortcut is the only way to intercept it. Registered
+    /// when recording starts, released centrally on return to Idle (see set_state).
+    /// Best-effort: failure just means Escape won't be intercepted.
+    fn register_escape(&self) {
+        use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
+        let esc = Shortcut::new(None, Code::Escape);
+        if let Err(e) = self.app_handle.global_shortcut().register(esc) {
+            tracing::warn!("Failed to register Escape shortcut: {}", e);
+        }
+    }
+
+    fn unregister_escape(&self) {
+        use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
+        let esc = Shortcut::new(None, Code::Escape);
+        let _ = self.app_handle.global_shortcut().unregister(esc);
+    }
+
+    /// Play a state-transition audio cue, unless the user has disabled sound
+    /// effects. Gated on the cached setting refreshed at each recording start.
+    fn play_sound(&self, cue: crate::sound::Cue) {
+        if self.sound_enabled.load(Ordering::SeqCst) {
+            crate::sound::play(cue);
+        }
+    }
+
+    /// Request that the in-flight result skip the editable preview and be
+    /// output directly. Triggered by a hotkey press while the pipeline is
+    /// transcribing/polishing (e.g. a quick double-press right after stopping).
+    /// No-op outside that window — between stop() and the preview being shown.
+    pub fn request_skip_preview(&self) {
+        let state = self.current_state();
+        if state == PipelineState::Transcribing || state == PipelineState::Polishing {
+            self.skip_preview_once.store(true, Ordering::SeqCst);
+            let _ = self.app_handle.emit("preview:skip-armed", true);
+            tracing::info!("Skip-preview armed; result will be output directly");
+        }
     }
 
     /// Immediately abort the pipeline regardless of current state.
@@ -389,7 +719,25 @@ impl PipelineHandle {
             .clear();
         *self.stt_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
+        // Stop any voice-edit listening task
+        if let Some(cmd_abort) = self
+            .preview_cmd_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            cmd_abort.notify_one();
+        }
+
+        // Discard any pending preview
+        self.preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.preview_ctx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
         // Force state to Idle — emits pipeline:state event to sync frontend
+        // (which also releases the global Escape grab).
         self.set_state(PipelineState::Idle);
     }
 
@@ -454,6 +802,8 @@ impl PipelineHandle {
 
         // Reset abort flag for new recording
         self.abort_flag.store(false, Ordering::SeqCst);
+        // Clear any stale skip-preview request from a previous run.
+        self.skip_preview_once.store(false, Ordering::SeqCst);
 
         // Atomic CAS: only one caller can transition Idle → Recording
         if self
@@ -471,6 +821,8 @@ impl PipelineHandle {
         let _ = self
             .app_handle
             .emit("pipeline:state", PipelineState::Recording);
+        // Grab Escape for the whole session so it can cancel/abort from any state.
+        self.register_escape();
         // Update tray for recording state
         if let Some(tray_handle) = self.app_handle.try_state::<crate::TrayHandle>() {
             if let Ok(t) = tray_handle.tray.lock() {
@@ -488,6 +840,11 @@ impl PipelineHandle {
 
         // P0-2: Load config BEFORE starting audio capture — fail fast on missing API key
         let config_data = self.load_config().await;
+        // Cache the sound setting for this run's state beeps, then sound the
+        // "listening" cue now that we know whether sound effects are enabled.
+        self.sound_enabled
+            .store(config_data.sound_effects_enabled, Ordering::SeqCst);
+        self.play_sound(crate::sound::Cue::Listening);
         *self
             .preloaded_config
             .lock()
@@ -584,6 +941,8 @@ impl PipelineHandle {
                     model: stt::doubao_audio::DOUBAO_AUDIO_MODEL.to_string(),
                     base_url: stt::doubao_audio::ARK_BASE_URL.to_string(),
                     system_prompt,
+                    app_handle: Some(self.app_handle.clone()),
+                    trim_silence: config_data.trim_silence,
                 })
             } else {
                 None
@@ -953,6 +1312,7 @@ impl PipelineHandle {
         let _ = self
             .app_handle
             .emit("pipeline:state", PipelineState::Transcribing);
+        self.play_sound(crate::sound::Cue::Transcribing);
         // Update tray for transcribing state
         if let Some(tray_handle) = self.app_handle.try_state::<crate::TrayHandle>() {
             if let Ok(t) = tray_handle.tray.lock() {
@@ -1072,25 +1432,18 @@ impl PipelineHandle {
             return Ok(());
         }
 
-        // ── Phase 2: LLM polish + output ───────────────────────────────
+        // ── Phase 2: produce final text (no output yet) ────────────────
         // Doubao audio provider returns already-polished text from disconnect(),
-        // so we skip the LLM step and output directly.
+        // so we skip the LLM step. Other providers run a separate LLM polish.
+        // Neither outputs here — output happens below, or is deferred to
+        // confirm_preview() when the preview setting is on.
+        // Keep a copy of the dictionary for voice-edit prompts in the preview.
+        let dictionary_for_preview = dictionary_words.clone();
         let (final_text, llm_elapsed) =
             if config.stt_provider == stt::doubao_audio::DOUBAO_AUDIO_PROVIDER {
-                self.set_state(PipelineState::Outputting);
-                // In a terminal, force clipboard paste so multi-line text is
-                // inserted via bracketed-paste (newlines shown, not executed).
-                let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
-                if let Err(e) = self
-                    .output_text(&raw_text, &app_ctx.app_name, &config, prefer_paste)
-                    .await
-                {
-                    tracing::error!("Output failed: {}", e);
-                    let _ = self.app_handle.emit("pipeline:error", output_user_error(&e));
-                }
                 (raw_text.clone(), std::time::Duration::ZERO)
             } else {
-                self.polish_text(
+                self.polish_to_text(
                     &raw_text,
                     &config,
                     &app_ctx,
@@ -1101,10 +1454,16 @@ impl PipelineHandle {
                 .await
             };
 
-        // ── Phase 3: Timing, history, cleanup ──────────────────────────
-        let total_elapsed = stop_start.elapsed();
+        // Check abort after producing text, before output/preview
+        if self.abort_flag.load(Ordering::SeqCst) {
+            tracing::info!("Pipeline aborted before output");
+            if let Some(control) = &stt_control {
+                self.clear_stt_session(control.id);
+            }
+            return Ok(());
+        }
 
-        // Compute recording duration
+        // Compute recording duration (needed by both paths)
         let duration_ms = self
             .recording_start
             .lock()
@@ -1112,6 +1471,49 @@ impl PipelineHandle {
             .take()
             .map(|start| start.elapsed().as_millis() as i64);
 
+        // ── Preview branch: hold text for the user, defer output/history ─
+        // A second hotkey press during Transcribing/Polishing arms a one-shot
+        // skip so the result is output directly instead of shown for preview.
+        let skip_preview = self.skip_preview_once.swap(false, Ordering::SeqCst);
+        if config.preview_before_output && !skip_preview {
+            *self.preview_text.lock().unwrap_or_else(|e| e.into_inner()) = final_text.clone();
+            *self.preview_ctx.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreviewContext {
+                raw_text: raw_text.clone(),
+                app_ctx: app_ctx.clone(),
+                config: config.clone(),
+                dictionary: dictionary_for_preview,
+                duration_ms,
+                stt_ms: stt_elapsed.as_millis() as u64,
+                llm_ms: llm_elapsed.as_millis() as u64,
+            });
+            if let Some(control) = &stt_control {
+                self.clear_stt_session(control.id);
+            }
+            self.preview_caret.store(usize::MAX, Ordering::SeqCst); // caret at end
+            self.set_state(PipelineState::Previewing);
+            let _ = self.app_handle.emit("preview:ready", &final_text);
+            let _ = self
+                .app_handle
+                .emit("preview:caret", final_text.chars().count());
+            // Start hands-free voice-edit listening (audio-native providers only).
+            self.start_preview_listening();
+            return Ok(());
+        }
+
+        // ── Phase 3: output, timing, history, cleanup ──────────────────
+        self.play_sound(crate::sound::Cue::Output);
+        let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
+        if let Err(e) = self
+            .output_text(&final_text, &app_ctx.app_name, &config, prefer_paste)
+            .await
+        {
+            tracing::error!("Output failed: {}", e);
+            let _ = self
+                .app_handle
+                .emit("pipeline:error", output_user_error(&e));
+        }
+
+        let total_elapsed = stop_start.elapsed();
         tracing::info!(
             "[Pipeline Timing] Total stop(): {}ms (STT: {}ms, LLM: {}ms, Output+Save: {}ms)",
             total_elapsed.as_millis(),
@@ -1140,6 +1542,245 @@ impl PipelineHandle {
         }
         self.set_state(PipelineState::Idle);
         Ok(())
+    }
+
+    /// Output the confirmed preview text to the target app and finish the
+    /// recording (timing + history). Called from confirm_preview().
+    async fn finish_preview(&self, text: &str, ctx: &PreviewContext) {
+        self.play_sound(crate::sound::Cue::Output);
+        let prefer_paste = ctx.app_ctx.app_type == crate::llm::AppType::Terminal;
+        if let Err(e) = self
+            .output_text(text, &ctx.app_ctx.app_name, &ctx.config, prefer_paste)
+            .await
+        {
+            tracing::error!("Output failed: {}", e);
+            let _ = self
+                .app_handle
+                .emit("pipeline:error", output_user_error(&e));
+        }
+
+        let _ = self.app_handle.emit(
+            "pipeline:timing",
+            serde_json::json!({
+                "stt_ms": ctx.stt_ms,
+                "llm_ms": ctx.llm_ms,
+                "total_ms": ctx.stt_ms + ctx.llm_ms,
+                "recording_ms": ctx.duration_ms,
+            }),
+        );
+
+        self.save_history(&ctx.raw_text, text, &ctx.app_ctx, ctx.duration_ms)
+            .await;
+    }
+
+    /// Confirm the current preview: output the (possibly edited) text to the
+    /// target app, save history, and return to Idle. No-op if not in Previewing.
+    pub async fn confirm_preview(&self) -> Result<()> {
+        if self
+            .state
+            .compare_exchange(
+                PipelineState::Previewing.as_u8(),
+                PipelineState::Outputting.as_u8(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _ = self
+            .app_handle
+            .emit("pipeline:state", PipelineState::Outputting);
+
+        // Stop any voice-edit listening before output.
+        self.stop_preview_listening();
+
+        let ctx = self
+            .preview_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let text = self
+            .preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        // Restore focus to the original target app (a click on the preview may
+        // have stolen it), then let the hotkey's modifier keys release before
+        // simulating output so the paste lands in the right window.
+        if let Some(ref ctx) = ctx {
+            let app_name = ctx.app_ctx.app_name.clone();
+            tokio::task::block_in_place(|| reactivate_app(&app_name));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PREVIEW_CONFIRM_OUTPUT_DELAY_MS,
+        ))
+        .await;
+
+        if let Some(ctx) = ctx {
+            self.finish_preview(&text, &ctx).await;
+        }
+
+        self.preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.set_state(PipelineState::Idle);
+        Ok(())
+    }
+
+    /// Discard the current preview without outputting. No-op if not previewing.
+    pub fn cancel_preview(&self) {
+        if self.current_state() != PipelineState::Previewing {
+            return;
+        }
+        self.stop_preview_listening();
+        // Return focus to the original target app — the focusable preview may
+        // have grabbed it. Detached so the osascript call never blocks.
+        if let Some(ctx) = self
+            .preview_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let app_name = ctx.app_ctx.app_name.clone();
+            std::thread::spawn(move || reactivate_app(&app_name));
+        }
+        self.preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.preview_ctx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.set_state(PipelineState::Idle);
+    }
+
+    /// Replace the preview text (used for manual keyboard edits from the UI).
+    pub fn set_preview_text(&self, text: String) {
+        if self.current_state() != PipelineState::Previewing {
+            return;
+        }
+        *self.preview_text.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    }
+
+    /// Set the caret position (in Unicode scalar values from the text start) for
+    /// voice insertion. Clamped when used. No-op outside Previewing.
+    pub fn set_preview_caret(&self, offset: usize) {
+        if self.current_state() != PipelineState::Previewing {
+            return;
+        }
+        self.preview_caret.store(offset, Ordering::SeqCst);
+    }
+
+    /// Begin hands-free voice-edit listening for the current preview. Captures
+    /// audio continuously and uses VAD to segment spoken commands. Implemented
+    /// for the audio-native Doubao provider; no-op otherwise.
+    fn start_preview_listening(&self) {
+        let ctx = match self
+            .preview_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(c) => c,
+            None => return,
+        };
+
+        if ctx.config.stt_provider != stt::doubao_audio::DOUBAO_AUDIO_PROVIDER {
+            tracing::info!(
+                "Preview voice-edit disabled: provider '{}' is not audio-native",
+                ctx.config.stt_provider
+            );
+            return; // voice editing requires an audio-native model
+        }
+        let api_key = ctx.config.stt_api_key.clone();
+        if api_key.is_empty() {
+            tracing::info!("Preview voice-edit disabled: STT API key is empty");
+            return;
+        }
+        let model = stt::doubao_audio::DOUBAO_AUDIO_MODEL.to_string();
+        let base_url = stt::doubao_audio::ARK_BASE_URL.to_string();
+        let system_prompt = llm_prompt::build_edit_action_prompt(
+            ctx.app_ctx.app_type,
+            &ctx.dictionary,
+            &ctx.config.polish_custom_prompt,
+        );
+
+        let (handle, audio_rx) = match AudioCaptureHandle::start(AudioConfig::default()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Preview command capture failed: {}", e);
+                return;
+            }
+        };
+        *self.audio_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+
+        let abort = Arc::new(Notify::new());
+        *self
+            .preview_cmd_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(abort.clone());
+
+        let _ = self.app_handle.emit("preview:listening", true);
+
+        let app_handle = self.app_handle.clone();
+        let client = self.shared_client.clone();
+        let preview_text = self.preview_text.clone();
+        let state = self.state.clone();
+        let preview_caret = self.preview_caret.clone();
+
+        tokio::spawn(async move {
+            run_preview_vad(
+                app_handle,
+                client,
+                audio_rx,
+                abort,
+                preview_text,
+                state,
+                api_key,
+                model,
+                base_url,
+                system_prompt,
+                preview_caret,
+            )
+            .await;
+        });
+    }
+
+    /// Stop the voice-edit listening task and its audio capture (preview stays).
+    fn stop_preview_listening(&self) {
+        {
+            let mut handle = self.audio_handle.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut h) = *handle {
+                h.stop();
+            }
+            *handle = None;
+        }
+        if let Some(abort) = self
+            .preview_cmd_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.notify_one();
+        }
+        let _ = self.app_handle.emit("preview:listening", false);
+    }
+
+    /// Discard the preview and immediately start a fresh content recording.
+    /// Triggered by a "rerecord" voice command in the preview.
+    pub async fn rerecord_preview(&self) {
+        self.stop_preview_listening();
+        self.preview_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.preview_ctx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.set_state(PipelineState::Idle);
+        if let Err(e) = self.start().await {
+            tracing::error!("Re-record start failed: {}", e);
+            let _ = self.app_handle.emit("pipeline:error", e.to_string());
+        }
     }
 
     /// Wait for the STT task to complete and return the transcribed text.
@@ -1195,9 +1836,11 @@ impl PipelineHandle {
         Ok(Some(raw_text))
     }
 
-    /// Polish raw text with LLM and output the result.
-    /// Returns (final_text, llm_elapsed_duration).
-    async fn polish_text(
+    /// Polish raw text with the LLM and return the result WITHOUT outputting.
+    /// Output is handled separately by the caller (directly, or after preview).
+    /// Returns (final_text, llm_elapsed_duration). On polish-disabled or LLM
+    /// failure it falls back to the raw text.
+    async fn polish_to_text(
         &self,
         raw_text: &str,
         config: &storage::AppConfig,
@@ -1206,28 +1849,15 @@ impl PipelineHandle {
         selected_text: Option<String>,
         session_token: String,
     ) -> (String, std::time::Duration) {
-        // In a terminal, force clipboard paste so multi-line text is inserted
-        // via bracketed-paste (newlines shown, not executed as commands).
-        let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
-
         // Check if polish is enabled and API key / token is available
         if !config.polish_enabled
             || (config.llm_api_key.is_empty() && config.llm_provider != "cloud")
         {
-            // No polishing — output raw text directly
-            if let Err(e) = self
-                .output_text(raw_text, &app_ctx.app_name, config, prefer_paste)
-                .await
-            {
-                tracing::error!("Output failed: {}", e);
-                let _ = self
-                    .app_handle
-                    .emit("pipeline:error", output_user_error(&e));
-            }
             return (raw_text.to_string(), std::time::Duration::ZERO);
         }
 
         self.set_state(PipelineState::Polishing);
+        self.play_sound(crate::sound::Cue::Polishing);
         let llm_start = std::time::Instant::now();
 
         let llm_api_key = if config.llm_provider == "cloud" {
@@ -1266,50 +1896,22 @@ impl PipelineHandle {
         let (final_text, llm_elapsed) =
             match provider.polish(&llm_config, &req, Some(&on_chunk)).await {
                 Ok(response) => {
-                    // Check abort after LLM returns — skip output if cancelled during polish
                     if self.abort_flag.load(Ordering::SeqCst) {
-                        tracing::info!("Pipeline aborted after LLM polish, skipping output");
+                        tracing::info!("Pipeline aborted after LLM polish");
                         return (raw_text.to_string(), llm_start.elapsed());
                     }
-                    let elapsed = llm_start.elapsed();
-                    if let Err(e) = self
-                        .output_text(
-                            &response.polished_text,
-                            &app_ctx.app_name,
-                            config,
-                            prefer_paste,
-                        )
-                        .await
-                    {
-                        tracing::error!("Output failed: {}", e);
-                        let _ = self
-                            .app_handle
-                            .emit("pipeline:error", output_user_error(&e));
-                    }
-                    (response.polished_text, elapsed)
+                    (response.polished_text, llm_start.elapsed())
                 }
                 Err(e) => {
-                    // Check abort after LLM error — skip fallback output if cancelled
                     if self.abort_flag.load(Ordering::SeqCst) {
-                        tracing::info!("Pipeline aborted after LLM error, skipping output");
+                        tracing::info!("Pipeline aborted after LLM error");
                         return (raw_text.to_string(), llm_start.elapsed());
                     }
-                    tracing::error!("LLM polish failed: {}, outputting raw text", e);
-                    let elapsed = llm_start.elapsed();
-
+                    tracing::error!("LLM polish failed: {}, falling back to raw text", e);
                     let _ = self
                         .app_handle
                         .emit("pipeline:error", llm_polish_user_error(&e));
-                    if let Err(e) = self
-                        .output_text(raw_text, &app_ctx.app_name, config, prefer_paste)
-                        .await
-                    {
-                        tracing::error!("Output failed: {}", e);
-                        let _ = self
-                            .app_handle
-                            .emit("pipeline:error", output_user_error(&e));
-                    }
-                    (raw_text.to_string(), elapsed)
+                    (raw_text.to_string(), llm_start.elapsed())
                 }
             };
 
@@ -1411,6 +2013,18 @@ impl PipelineHandle {
             Err(e) => anyhow::bail!("{}", e),
         }
 
+        // Optionally submit the output with a trailing Enter (e.g. run the
+        // command in a terminal) so the user doesn't press it manually. Output
+        // already landed, so a failure here is logged but not fatal.
+        if config.output_append_enter {
+            tokio::time::sleep(std::time::Duration::from_millis(APPEND_ENTER_DELAY_MS)).await;
+            match tokio::task::spawn_blocking(output::press_enter).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Append-enter failed: {}", e),
+                Err(e) => tracing::warn!("Append-enter task error: {}", e),
+            }
+        }
+
         let _ = self.app_handle.emit("pipeline:target_app", app_name);
         Ok(())
     }
@@ -1479,6 +2093,37 @@ impl PipelineHandle {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    #[test]
+    fn extract_cursor_marker_strips_primary_and_reports_caret() {
+        let (clean, caret) = extract_cursor_marker("hello‸ world");
+        assert_eq!(clean, "hello world");
+        assert_eq!(caret, 5);
+    }
+
+    #[test]
+    fn extract_cursor_marker_defaults_caret_to_end_when_absent() {
+        let (clean, caret) = extract_cursor_marker("no marker here");
+        assert_eq!(clean, "no marker here");
+        assert_eq!(caret, "no marker here".chars().count());
+    }
+
+    #[test]
+    fn extract_cursor_marker_strips_legacy_wrapped_brackets() {
+        // Regression: the model used to wrap inserted text in ⟦…⟧, leaking the
+        // bracket glyphs. They must be stripped and never appear in the result.
+        let (clean, caret) = extract_cursor_marker("前缀⟦插入的内容⟧后缀");
+        assert_eq!(clean, "前缀插入的内容后缀");
+        assert_eq!(caret, "前缀".chars().count());
+    }
+
+    #[test]
+    fn extract_cursor_marker_counts_caret_in_code_points() {
+        // Caret offset is measured in Unicode scalars, after stripping markers.
+        let (clean, caret) = extract_cursor_marker("😀😀‸tail");
+        assert_eq!(clean, "😀😀tail");
+        assert_eq!(caret, 2);
+    }
 
     #[test]
     fn output_user_error_preserves_accessibility_required() {

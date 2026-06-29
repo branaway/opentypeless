@@ -149,6 +149,8 @@ mod tests {
             model: doubao_audio::DOUBAO_AUDIO_MODEL.to_string(),
             base_url: doubao_audio::ARK_BASE_URL.to_string(),
             system_prompt: "You are a test assistant.".to_string(),
+            app_handle: None,
+            trim_silence: true,
         };
         let provider =
             create_provider(doubao_audio::DOUBAO_AUDIO_PROVIDER, None, Some(cfg), None).unwrap();

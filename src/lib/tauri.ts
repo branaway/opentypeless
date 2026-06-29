@@ -19,6 +19,22 @@ export async function abortRecording(): Promise<void> {
   return invoke('abort_recording')
 }
 
+export async function confirmPreview(): Promise<void> {
+  return invoke('confirm_preview')
+}
+
+export async function cancelPreview(): Promise<void> {
+  return invoke('cancel_preview')
+}
+
+export async function setPreviewText(text: string): Promise<void> {
+  return invoke('set_preview_text', { text })
+}
+
+export async function setPreviewCaret(offset: number): Promise<void> {
+  return invoke('set_preview_caret', { offset })
+}
+
 // Config commands
 export async function getConfig(): Promise<AppConfig> {
   return invoke('get_config')
@@ -117,6 +133,26 @@ export async function getHistory(limit: number, offset: number): Promise<History
 
 export async function clearHistory(): Promise<void> {
   return invoke('clear_history')
+}
+
+// Usage / cost auditing
+export interface UsageSummary {
+  total_cost: number
+  month_cost: number
+  today_cost: number
+  total_calls: number
+  audio_tokens: number
+  input_tokens: number
+  output_tokens: number
+  currency: string
+}
+
+export async function getUsageSummary(): Promise<UsageSummary> {
+  return invoke('get_usage_summary')
+}
+
+export async function clearUsage(): Promise<void> {
+  return invoke('clear_usage')
 }
 
 // Dictionary

@@ -14,6 +14,7 @@ import {
   getHotkeyRegistrationError,
 } from './lib/tauri'
 import { Capsule } from './components/Capsule'
+import { PreviewWindow } from './components/Preview/PreviewWindow'
 import { Settings } from './components/Settings'
 import { History } from './components/History'
 import { Onboarding } from './components/Onboarding'
@@ -49,6 +50,32 @@ function CapsuleApp() {
   // which works on both Windows and macOS. The previous rAF-based show approach
   // failed on macOS because WKWebView pauses requestAnimationFrame in hidden windows.
   return <Capsule />
+}
+
+// The dedicated, focusable preview window (#preview). Reuses the same Tauri
+// event wiring as the capsule so preview:* / pipeline:state events land in this
+// window's store; PreviewWindow shows/hides itself based on pipeline state.
+function PreviewApp() {
+  useTauriEvents()
+  useTheme()
+
+  const setConfig = useAppStore((s) => s.setConfig)
+
+  useEffect(() => {
+    getConfig()
+      .then((config) => {
+        setConfig(config)
+        if (config.ui_language && config.ui_language !== i18n.language) {
+          i18n.changeLanguage(config.ui_language)
+          localStorage.setItem('ui_language', config.ui_language)
+        }
+      })
+      .catch((e) => {
+        console.error('Failed to load config in preview:', e)
+      })
+  }, [setConfig])
+
+  return <PreviewWindow />
 }
 
 function MainApp() {
@@ -105,7 +132,6 @@ function MainApp() {
       }
       setLoaded(true)
     })
-
   }, [
     setOnboardingCompleted,
     setConfig,
@@ -152,6 +178,7 @@ function MainApp() {
 function App() {
   // Capsule window loads with #capsule hash — detect synchronously, no race condition
   if (window.location.hash === '#capsule') return <CapsuleApp />
+  if (window.location.hash === '#preview') return <PreviewApp />
   return <MainApp />
 }
 

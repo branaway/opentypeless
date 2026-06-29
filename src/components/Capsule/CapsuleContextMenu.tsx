@@ -1,6 +1,17 @@
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Settings, History, LogOut, CircleUser, Crown, AppWindow, Eye, EyeOff } from 'lucide-react'
-import { setCapsuleAutoHide } from '../../lib/tauri'
+import {
+  Settings,
+  History,
+  LogOut,
+  CircleUser,
+  Crown,
+  AppWindow,
+  Eye,
+  EyeOff,
+  Wallet,
+} from 'lucide-react'
+import { setCapsuleAutoHide, getUsageSummary } from '../../lib/tauri'
 import { useAppStore } from '../../stores/appStore'
 
 interface Props {
@@ -10,6 +21,17 @@ interface Props {
 export function CapsuleContextMenu({ onClose }: Props) {
   const { t } = useTranslation()
   const capsuleAutoHide = useAppStore((s) => s.config.capsule_auto_hide)
+  const [monthCost, setMonthCost] = useState<string | null>(null)
+
+  useEffect(() => {
+    getUsageSummary()
+      .then((u) => {
+        const symbol = u.currency === 'CNY' ? '¥' : ''
+        const digits = u.month_cost > 0 && u.month_cost < 0.1 ? 4 : 2
+        setMonthCost(`${symbol}${u.month_cost.toFixed(digits)}`)
+      })
+      .catch(() => setMonthCost(null))
+  }, [])
 
   const openMainWindow = async (hash: string) => {
     try {
@@ -73,6 +95,18 @@ export function CapsuleContextMenu({ onClose }: Props) {
       label: t('capsule.menu.upgrade'),
       onClick: () => {
         openMainWindow('#/upgrade')
+        onClose()
+      },
+    },
+    { type: 'separator' as const },
+    {
+      icon: Wallet,
+      label:
+        monthCost === null
+          ? t('capsule.menu.usage')
+          : `${t('capsule.menu.usage')} · ${t('capsule.menu.usageMonth', { amount: monthCost })}`,
+      onClick: () => {
+        openMainWindow('#/settings/usage')
         onClose()
       },
     },

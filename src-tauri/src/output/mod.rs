@@ -23,6 +23,43 @@ pub fn create_output(mode: OutputMode, app_handle: &tauri::AppHandle) -> Box<dyn
     }
 }
 
+/// Simulate a single plain Return/Enter keypress in the focused app, used to
+/// optionally submit the output right after the text was typed or pasted (e.g.
+/// run a terminal command or send a chat message). This is a *plain* Return —
+/// distinct from the Shift+Return soft newlines keyboard typing uses for line
+/// breaks within the text.
+///
+/// The mechanism mirrors the paste path per platform so it needs no extra
+/// permissions: on macOS via System Events (covered by the apple-events
+/// entitlement, no Accessibility prompt), elsewhere via enigo.
+pub fn press_enter() -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        // key code 36 == Return.
+        let status = std::process::Command::new("osascript")
+            .args(["-e", r#"tell application "System Events" to key code 36"#])
+            .status()
+            .map_err(|e| AppError::Output(format!("osascript enter error: {}", e)))?;
+        if !status.success() {
+            return Err(AppError::Output(format!(
+                "osascript enter failed with exit code: {:?}",
+                status.code()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| AppError::Output(format!("Failed to create Enigo: {:?}", e)))?;
+        enigo
+            .key(Key::Return, Direction::Click)
+            .map_err(|e| AppError::Output(format!("Enter key error: {:?}", e)))?;
+        Ok(())
+    }
+}
+
 fn clipboard_warning_for_platform() -> Option<UserError> {
     if crate::platform::is_wayland_session() {
         Some(UserError {

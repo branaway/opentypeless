@@ -50,6 +50,18 @@ describe('getCapsuleVisibility', () => {
     ).toBe(true)
   })
 
+  it('keeps the capsule visible while previewing (mic indicator for voice editing)', () => {
+    expect(
+      getCapsuleVisibility({
+        capsuleAutoHide: true,
+        contextMenuOpen: false,
+        capsuleExpanded: false,
+        hasError: false,
+        pipelineState: 'previewing',
+      }),
+    ).toBe(true)
+  })
+
   it('keeps the capsule overlay from stealing keyboard output focus', () => {
     expect(getCapsuleFocusable()).toBe(false)
   })

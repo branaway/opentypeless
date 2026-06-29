@@ -1,6 +1,12 @@
 import { create } from 'zustand'
 
-export type PipelineState = 'idle' | 'recording' | 'transcribing' | 'polishing' | 'outputting'
+export type PipelineState =
+  | 'idle'
+  | 'recording'
+  | 'transcribing'
+  | 'polishing'
+  | 'outputting'
+  | 'previewing'
 
 export type SttProvider =
   | 'deepgram'
@@ -86,6 +92,10 @@ export interface AppConfig {
   max_recording_seconds: number
   ui_language: string
   capsule_auto_hide: boolean
+  preview_before_output: boolean
+  sound_effects_enabled: boolean
+  output_append_enter: boolean
+  trim_silence: boolean
 }
 
 export type TestStatus = 'idle' | 'testing' | 'success' | 'error'
@@ -98,6 +108,9 @@ interface AppState {
   // Recording
   audioVolume: number
   setAudioVolume: (v: number) => void
+  // Fraction (0..1) of the max recording budget used by voiced time so far.
+  recordingProgress: number
+  setRecordingProgress: (v: number) => void
   partialTranscript: string
   setPartialTranscript: (t: string) => void
   finalTranscript: string
@@ -109,6 +122,20 @@ interface AppState {
   setRecordingDuration: (d: number) => void
   targetApp: string
   setTargetApp: (app: string) => void
+
+  // Preview (editable polished text shown before output)
+  previewText: string
+  setPreviewText: (t: string) => void
+  // Caret position (Unicode code-point offset) the backend wants applied to the
+  // editable preview — bumped on every model edit/insert so the UI can follow.
+  previewCaret: number
+  setPreviewCaret: (n: number) => void
+  previewListening: boolean
+  setPreviewListening: (v: boolean) => void
+  previewThinking: boolean
+  setPreviewThinking: (v: boolean) => void
+  previewSkipArmed: boolean
+  setPreviewSkipArmed: (v: boolean) => void
 
   // Config
   config: AppConfig
@@ -211,6 +238,10 @@ const defaultConfig: AppConfig = {
   max_recording_seconds: 30,
   ui_language: 'en',
   capsule_auto_hide: true,
+  preview_before_output: true,
+  sound_effects_enabled: true,
+  output_append_enter: true,
+  trim_silence: true,
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -219,6 +250,8 @@ export const useAppStore = create<AppState>((set) => ({
 
   audioVolume: 0,
   setAudioVolume: (audioVolume) => set({ audioVolume }),
+  recordingProgress: 0,
+  setRecordingProgress: (recordingProgress) => set({ recordingProgress }),
   partialTranscript: '',
   setPartialTranscript: (partialTranscript) => set({ partialTranscript }),
   finalTranscript: '',
@@ -230,6 +263,17 @@ export const useAppStore = create<AppState>((set) => ({
   setRecordingDuration: (recordingDuration) => set({ recordingDuration }),
   targetApp: '',
   setTargetApp: (targetApp) => set({ targetApp }),
+
+  previewText: '',
+  setPreviewText: (previewText) => set({ previewText }),
+  previewCaret: 0,
+  setPreviewCaret: (previewCaret) => set({ previewCaret }),
+  previewListening: false,
+  setPreviewListening: (previewListening) => set({ previewListening }),
+  previewThinking: false,
+  setPreviewThinking: (previewThinking) => set({ previewThinking }),
+  previewSkipArmed: false,
+  setPreviewSkipArmed: (previewSkipArmed) => set({ previewSkipArmed }),
 
   config: defaultConfig,
   setConfig: (config) => set({ config }),
@@ -287,6 +331,7 @@ export const useAppStore = create<AppState>((set) => ({
   resetRecording: () =>
     set({
       audioVolume: 0,
+      recordingProgress: 0,
       partialTranscript: '',
       finalTranscript: '',
       polishedText: '',

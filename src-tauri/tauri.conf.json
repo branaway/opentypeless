@@ -43,6 +43,23 @@
         "visible": false,
         "visibleOnAllWorkspaces": true,
         "url": "index.html#capsule"
+      },
+      {
+        "label": "preview",
+        "title": "OpenTypeless Preview",
+        "width": 400,
+        "height": 260,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "focusable": true,
+        "visible": false,
+        "visibleOnAllWorkspaces": true,
+        "url": "index.html#preview"
       }
     ],
     "security": {

@@ -26,10 +26,33 @@ pub fn build_shortcut_handler(
        + Send
        + Sync
        + 'static {
-    move |_app, _shortcut, event| {
+    move |_app, shortcut, event| {
         let handle = app_handle.clone();
         match event.state {
             ShortcutState::Pressed => {
+                // Escape is registered for the whole active session (recording
+                // through preview). It cancels/dismisses the current operation —
+                // the capsule window can't receive keys itself, so we grab it
+                // globally for the duration.
+                if shortcut.key == Code::Escape && shortcut.mods.is_empty() {
+                    // Defer onto the runtime so we don't re-enter the global
+                    // shortcut plugin (cancel paths unregister Escape) from
+                    // inside its own callback.
+                    tauri::async_runtime::spawn(async move {
+                        let pipeline = handle.state::<pipeline::PipelineHandle>();
+                        match pipeline.current_state() {
+                            // Previewing: discard the held text.
+                            pipeline::PipelineState::Previewing => pipeline.cancel_preview(),
+                            // Actively capturing/processing: abort the whole run.
+                            pipeline::PipelineState::Recording
+                            | pipeline::PipelineState::Transcribing
+                            | pipeline::PipelineState::Polishing => pipeline.abort(),
+                            // Idle / Outputting: nothing to cancel.
+                            _ => {}
+                        }
+                    });
+                    return;
+                }
                 let hotkey_mode = handle
                     .state::<HotkeyModeCache>()
                     .0
@@ -38,6 +61,28 @@ pub fn build_shortcut_handler(
                     .clone();
                 tauri::async_runtime::spawn(async move {
                     let pipeline = handle.state::<pipeline::PipelineHandle>();
+
+                    // In preview, the hotkey confirms & sends the previewed text.
+                    if pipeline.current_state() == pipeline::PipelineState::Previewing {
+                        if let Err(e) = pipeline.confirm_preview().await {
+                            tracing::error!("Failed to confirm preview: {}", e);
+                            let _ = handle.emit("pipeline:error", e.to_string());
+                        }
+                        return;
+                    }
+
+                    // A press while transcribing/polishing (e.g. a quick
+                    // double-press after stopping) skips the editable preview so
+                    // the result is output directly once it's ready. Placed
+                    // before the mode branch so it works in both toggle and hold
+                    // modes and doesn't accidentally start a new recording.
+                    let state = pipeline.current_state();
+                    if state == pipeline::PipelineState::Transcribing
+                        || state == pipeline::PipelineState::Polishing
+                    {
+                        pipeline.request_skip_preview();
+                        return;
+                    }
 
                     if hotkey_mode == "toggle" {
                         if pipeline.current_state() == pipeline::PipelineState::Idle {
@@ -56,6 +101,10 @@ pub fn build_shortcut_handler(
                 });
             }
             ShortcutState::Released => {
+                // Escape's release must not be treated as a hold-mode stop.
+                if shortcut.key == Code::Escape && shortcut.mods.is_empty() {
+                    return;
+                }
                 let hotkey_mode = handle
                     .state::<HotkeyModeCache>()
                     .0

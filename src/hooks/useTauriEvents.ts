@@ -17,6 +17,11 @@ export function useTauriEvents() {
     appendPolishedChunk,
     setPipelineState,
     setTargetApp,
+    setPreviewText,
+    setPreviewCaret,
+    setPreviewListening,
+    setPreviewThinking,
+    setPreviewSkipArmed,
     setPipelineError,
     setAccessibilityTrusted,
     setHistory,
@@ -51,8 +56,10 @@ export function useTauriEvents() {
       if (state === 'recording') {
         // Clear any previous error when starting a new pipeline run
         setPipelineError(null)
+        setPreviewSkipArmed(false)
       }
       if (state === 'idle') {
+        setPreviewSkipArmed(false)
         // Don't clear pipelineError here — CapsuleError auto-resets after 2.5s.
         // Clearing here would swallow errors from failed start() calls that
         // transition Recording → Idle in rapid succession.
@@ -64,6 +71,15 @@ export function useTauriEvents() {
       }
     })
     addListener<string>('pipeline:target_app', setTargetApp)
+    addListener<string>('preview:ready', setPreviewText)
+    addListener<number>('preview:caret', setPreviewCaret)
+    addListener<boolean>('preview:listening', setPreviewListening)
+    addListener<boolean>('preview:thinking', setPreviewThinking)
+    addListener<boolean>('preview:skip-armed', setPreviewSkipArmed)
+    addListener<PipelineErrorPayload>('preview:edit_error', (payload) => {
+      const capsuleErrorKey = capsuleErrorKeyFromPayload(payload)
+      toast(t(`capsule.errors.${capsuleErrorKey}`), 'error')
+    })
     addListener<PipelineErrorPayload>('pipeline:error', (payload) => {
       const capsuleErrorKey = capsuleErrorKeyFromPayload(payload)
       setPipelineError(t(`capsule.errors.${capsuleErrorKey}`))
@@ -110,6 +126,11 @@ export function useTauriEvents() {
     appendPolishedChunk,
     setPipelineState,
     setTargetApp,
+    setPreviewText,
+    setPreviewCaret,
+    setPreviewListening,
+    setPreviewThinking,
+    setPreviewSkipArmed,
     setPipelineError,
     setAccessibilityTrusted,
     setHistory,

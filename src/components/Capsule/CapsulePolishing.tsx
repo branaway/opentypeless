@@ -1,10 +1,12 @@
 import { useTranslation } from 'react-i18next'
 import { motion, useReducedMotion } from 'framer-motion'
-import { X } from 'lucide-react'
+import { X, FastForward } from 'lucide-react'
 import { abortRecording } from '../../lib/tauri'
+import { useAppStore } from '../../stores/appStore'
 
 export function CapsulePolishing() {
   const { t } = useTranslation()
+  const skipArmed = useAppStore((s) => s.previewSkipArmed)
   const reduced = useReducedMotion()
 
   const handleCancel = async (e: React.MouseEvent) => {
@@ -37,6 +39,13 @@ export function CapsulePolishing() {
       <p className="text-[11px] text-white leading-snug truncate flex-1 min-w-0">
         {t('capsule.thinking')}
       </p>
+      {skipArmed && (
+        <FastForward
+          size={12}
+          className="flex-shrink-0 text-white/90"
+          aria-label={t('capsule.preview.skipArmed')}
+        />
+      )}
       <button
         onClick={handleCancel}
         aria-label={t('capsule.cancelPolishing')}

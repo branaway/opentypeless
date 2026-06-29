@@ -1,12 +1,13 @@
 import { useTranslation } from 'react-i18next'
 import { motion, useReducedMotion } from 'framer-motion'
-import { Loader2, X } from 'lucide-react'
+import { Loader2, X, FastForward } from 'lucide-react'
 import { abortRecording } from '../../lib/tauri'
 import { useAppStore } from '../../stores/appStore'
 
 export function CapsuleProcessing() {
   const { t } = useTranslation()
   const partialTranscript = useAppStore((s) => s.partialTranscript)
+  const skipArmed = useAppStore((s) => s.previewSkipArmed)
   const reduced = useReducedMotion()
 
   const displayText = partialTranscript || t('capsule.transcribing')
@@ -43,6 +44,13 @@ export function CapsuleProcessing() {
           transition={{ repeat: Infinity, duration: 0.8 }}
         />
       </p>
+      {skipArmed && (
+        <FastForward
+          size={12}
+          className="flex-shrink-0 text-white/90"
+          aria-label={t('capsule.preview.skipArmed')}
+        />
+      )}
       <button
         onPointerDown={stopPointerPropagation}
         onPointerUp={stopPointerPropagation}

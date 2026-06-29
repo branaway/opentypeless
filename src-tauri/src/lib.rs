@@ -9,6 +9,7 @@ pub mod llm;
 pub mod output;
 pub mod pipeline;
 pub mod platform;
+pub mod sound;
 pub mod storage;
 pub mod stt;
 pub mod tray;
@@ -99,6 +100,35 @@ fn abort_recording(state: tauri::State<'_, pipeline::PipelineHandle>) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+async fn confirm_preview(state: tauri::State<'_, pipeline::PipelineHandle>) -> Result<(), String> {
+    state.confirm_preview().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cancel_preview(state: tauri::State<'_, pipeline::PipelineHandle>) -> Result<(), String> {
+    state.cancel_preview();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_preview_text(
+    state: tauri::State<'_, pipeline::PipelineHandle>,
+    text: String,
+) -> Result<(), String> {
+    state.set_preview_text(text);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_preview_caret(
+    state: tauri::State<'_, pipeline::PipelineHandle>,
+    offset: usize,
+) -> Result<(), String> {
+    state.set_preview_caret(offset);
+    Ok(())
+}
+
 /// On Linux with NVIDIA proprietary drivers + Wayland, WebKit's DMA-BUF renderer
 /// crashes in libnvidia-eglcore during GL context teardown. Set env vars to disable
 /// it before any WebView is created. See GitHub issue #36.
@@ -185,8 +215,10 @@ pub fn run() {
             let config_manager = storage::ConfigManager::new(app_handle.clone());
             let history_store = storage::HistoryStore::new(db_path.clone())
                 .map_err(|e| anyhow::anyhow!("Failed to init history store: {}", e))?;
-            let dictionary_store = storage::DictionaryStore::new(db_path)
+            let dictionary_store = storage::DictionaryStore::new(db_path.clone())
                 .map_err(|e| anyhow::anyhow!("Failed to init dictionary store: {}", e))?;
+            let usage_store = storage::UsageStore::new(db_path)
+                .map_err(|e| anyhow::anyhow!("Failed to init usage store: {}", e))?;
 
             let shared_client = reqwest::Client::builder()
                 .pool_max_idle_per_host(2)
@@ -207,6 +239,7 @@ pub fn run() {
             app.manage(config_manager);
             app.manage(history_store);
             app.manage(dictionary_store);
+            app.manage(usage_store);
             app.manage(shared_client);
             app.manage(pipeline_handle);
             app.manage(HotkeyModeCache(Arc::new(Mutex::new(
@@ -463,6 +496,10 @@ pub fn run() {
             start_recording,
             stop_recording,
             abort_recording,
+            confirm_preview,
+            cancel_preview,
+            set_preview_text,
+            set_preview_caret,
             commands::misc::check_accessibility_permission,
             commands::misc::request_accessibility_permission,
             commands::config::get_config,
@@ -474,6 +511,8 @@ pub fn run() {
             commands::llm::fetch_llm_models,
             commands::history::get_history,
             commands::history::clear_history,
+            commands::usage::get_usage_summary,
+            commands::usage::clear_usage,
             commands::dictionary::get_dictionary,
             commands::dictionary::add_dictionary_entry,
             commands::dictionary::remove_dictionary_entry,
