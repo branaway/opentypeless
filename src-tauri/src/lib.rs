@@ -2,6 +2,8 @@ pub mod app_detector;
 pub mod audio;
 pub mod commands;
 pub mod error;
+#[cfg(target_os = "macos")]
+pub mod fn_hotkey;
 pub mod hotkey;
 #[cfg(target_os = "linux")]
 mod linux_x11;
@@ -20,6 +22,9 @@ pub use tray::{refresh_tray, TrayHandle};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::MacosLauncher;
+// Used to register the configurable global shortcut; on macOS the Fn-key tap is
+// the trigger instead, so this is only needed off-macOS.
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tauri_plugin_store::StoreExt;
 use tracing_subscriber::EnvFilter;
@@ -264,13 +269,25 @@ pub fn run() {
                 }
             }
 
-            // Register global shortcut from config
+            // The global-shortcut plugin is always initialized — Escape (cancel)
+            // and non-macOS triggers go through it.
             let handler = hotkey::build_shortcut_handler(app_handle.clone());
             app.handle().plugin(
                 tauri_plugin_global_shortcut::Builder::new()
                     .with_handler(handler)
                     .build(),
             )?;
+
+            // macOS: the trigger is a single tap of the Fn / 🌐 key, handled by a
+            // CoreGraphics event tap (Carbon hotkeys can't see Fn), so we do NOT
+            // register the config shortcut here. Other platforms keep the
+            // configurable global shortcut.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = &shortcut; // not registered on macOS; Fn tap is the trigger
+                fn_hotkey::spawn(app_handle.clone());
+            }
+            #[cfg(not(target_os = "macos"))]
             if let Err(e) = app.global_shortcut().register(shortcut) {
                 let message = format!(
                     "Failed to register shortcut '{}' (may be occupied): {e}",

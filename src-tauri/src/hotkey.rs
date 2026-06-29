@@ -59,46 +59,7 @@ pub fn build_shortcut_handler(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                tauri::async_runtime::spawn(async move {
-                    let pipeline = handle.state::<pipeline::PipelineHandle>();
-
-                    // In preview, the hotkey confirms & sends the previewed text.
-                    if pipeline.current_state() == pipeline::PipelineState::Previewing {
-                        if let Err(e) = pipeline.confirm_preview().await {
-                            tracing::error!("Failed to confirm preview: {}", e);
-                            let _ = handle.emit("pipeline:error", e.to_string());
-                        }
-                        return;
-                    }
-
-                    // A press while transcribing/polishing (e.g. a quick
-                    // double-press after stopping) skips the editable preview so
-                    // the result is output directly once it's ready. Placed
-                    // before the mode branch so it works in both toggle and hold
-                    // modes and doesn't accidentally start a new recording.
-                    let state = pipeline.current_state();
-                    if state == pipeline::PipelineState::Transcribing
-                        || state == pipeline::PipelineState::Polishing
-                    {
-                        pipeline.request_skip_preview();
-                        return;
-                    }
-
-                    if hotkey_mode == "toggle" {
-                        if pipeline.current_state() == pipeline::PipelineState::Idle {
-                            if let Err(e) = pipeline.start().await {
-                                tracing::error!("Failed to start recording: {}", e);
-                                let _ = handle.emit("pipeline:error", e.to_string());
-                            }
-                        } else if let Err(e) = pipeline.stop().await {
-                            tracing::error!("Failed to stop recording: {}", e);
-                            let _ = handle.emit("pipeline:error", e.to_string());
-                        }
-                    } else if let Err(e) = pipeline.start().await {
-                        tracing::error!("Failed to start recording: {}", e);
-                        let _ = handle.emit("pipeline:error", e.to_string());
-                    }
-                });
+                spawn_press(handle, hotkey_mode);
             }
             ShortcutState::Released => {
                 // Escape's release must not be treated as a hold-mode stop.
@@ -123,6 +84,51 @@ pub fn build_shortcut_handler(
             }
         }
     }
+}
+
+/// Run the hotkey "press" action: the same toggle/hold flow used by the global
+/// shortcut handler. Extracted so alternative triggers (e.g. the macOS Fn-key
+/// tap) reuse the identical behavior. `hotkey_mode` is "toggle" or "hold".
+pub fn spawn_press(handle: tauri::AppHandle, hotkey_mode: String) {
+    tauri::async_runtime::spawn(async move {
+        let pipeline = handle.state::<pipeline::PipelineHandle>();
+
+        // In preview, the hotkey confirms & sends the previewed text.
+        if pipeline.current_state() == pipeline::PipelineState::Previewing {
+            if let Err(e) = pipeline.confirm_preview().await {
+                tracing::error!("Failed to confirm preview: {}", e);
+                let _ = handle.emit("pipeline:error", e.to_string());
+            }
+            return;
+        }
+
+        // A press while transcribing/polishing (e.g. a quick double-press after
+        // stopping) skips the editable preview so the result is output directly
+        // once it's ready. Placed before the mode branch so it works in both
+        // toggle and hold modes and doesn't accidentally start a new recording.
+        let state = pipeline.current_state();
+        if state == pipeline::PipelineState::Transcribing
+            || state == pipeline::PipelineState::Polishing
+        {
+            pipeline.request_skip_preview();
+            return;
+        }
+
+        if hotkey_mode == "toggle" {
+            if pipeline.current_state() == pipeline::PipelineState::Idle {
+                if let Err(e) = pipeline.start().await {
+                    tracing::error!("Failed to start recording: {}", e);
+                    let _ = handle.emit("pipeline:error", e.to_string());
+                }
+            } else if let Err(e) = pipeline.stop().await {
+                tracing::error!("Failed to stop recording: {}", e);
+                let _ = handle.emit("pipeline:error", e.to_string());
+            }
+        } else if let Err(e) = pipeline.start().await {
+            tracing::error!("Failed to start recording: {}", e);
+            let _ = handle.emit("pipeline:error", e.to_string());
+        }
+    });
 }
 
 pub fn parse_hotkey(s: &str) -> Option<Shortcut> {

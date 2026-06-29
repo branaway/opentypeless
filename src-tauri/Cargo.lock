@@ -3086,6 +3086,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "core-foundation 0.10.1",
+ "core-graphics 0.25.0",
  "cpal",
  "enigo",
  "flate2",

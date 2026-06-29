@@ -56,6 +56,12 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Fn / 🌐 key trigger: the global-shortcut plugin (Carbon hotkeys) can't see the
+# Fn key, so we tap CoreGraphics events directly to detect a single Fn tap.
+core-graphics = "0.25"
+core-foundation = "0.10"
+
 [profile.release]
 codegen-units = 1
 opt-level = "s"
