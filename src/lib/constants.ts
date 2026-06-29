@@ -12,7 +12,7 @@ export const UI_LANGUAGES = [
   { value: 'it', label: 'Italiano' },
 ] as const
 
-export const APP_NAME = 'OpenTypeless'
+export const APP_NAME = 'MyTypeless'
 export const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? 'v0.1.41'
 export const APP_REPO_URL = 'https://github.com/tover0314-w/opentypeless'
 export const APP_LICENSE_URL = 'https://github.com/tover0314-w/opentypeless/blob/main/LICENSE'

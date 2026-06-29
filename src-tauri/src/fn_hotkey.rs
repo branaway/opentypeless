@@ -148,7 +148,7 @@ fn run(app_handle: tauri::AppHandle) {
         Err(_) => {
             tracing::warn!(
                 "Fn-key tap could not be created (grant Accessibility / Input Monitoring \
-                 to OpenTypeless in System Settings → Privacy & Security)"
+                 to MyTypeless in System Settings → Privacy & Security)"
             );
             return;
         }

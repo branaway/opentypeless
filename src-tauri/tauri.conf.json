@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenTypeless",
+  "productName": "MyTypeless",
   "version": "0.1.41",
-  "identifier": "com.opentypeless.app",
+  "identifier": "com.mytypeless.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "OpenTypeless",
+        "title": "MyTypeless",
         "width": 900,
         "height": 700,
         "minWidth": 720,
@@ -29,7 +29,7 @@
       },
       {
         "label": "capsule",
-        "title": "OpenTypeless Capsule",
+        "title": "MyTypeless Capsule",
         "width": 80,
         "height": 80,
         "resizable": false,
@@ -46,7 +46,7 @@
       },
       {
         "label": "preview",
-        "title": "OpenTypeless Preview",
+        "title": "MyTypeless Preview",
         "width": 400,
         "height": 260,
         "resizable": false,
