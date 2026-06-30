@@ -50,3 +50,6 @@ docs/superpowers/
 
 # Local isolated worktrees
 .worktrees/
+
+# Local-only benchmark scratch (not part of the test suite)
+src-tauri/tests/service_tier_bench.rs
