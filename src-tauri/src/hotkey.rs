@@ -53,6 +53,37 @@ pub fn build_shortcut_handler(
                     });
                     return;
                 }
+                // Return is grabbed for the whole active session and means
+                // "send now, with a trailing Enter" — the counterpart to the
+                // hotkey's "send, no Enter". From any active state it finalizes
+                // the run: Recording → stop+skip preview; Transcribing/Polishing
+                // → skip preview; Previewing → confirm. The trailing-Enter intent
+                // is latched and applied when output happens.
+                if shortcut.key == Code::Enter && shortcut.mods.is_empty() {
+                    tauri::async_runtime::spawn(async move {
+                        let pipeline = handle.state::<pipeline::PipelineHandle>();
+                        pipeline.set_append_enter_override(true);
+                        match pipeline.current_state() {
+                            pipeline::PipelineState::Recording => {
+                                pipeline.arm_skip_preview();
+                                if let Err(e) = pipeline.stop().await {
+                                    tracing::error!("Failed to stop recording: {}", e);
+                                    let _ = handle.emit("pipeline:error", e.to_string());
+                                }
+                            }
+                            pipeline::PipelineState::Transcribing
+                            | pipeline::PipelineState::Polishing => pipeline.request_skip_preview(),
+                            pipeline::PipelineState::Previewing => {
+                                if let Err(e) = pipeline.confirm_preview().await {
+                                    tracing::error!("Failed to confirm preview: {}", e);
+                                    let _ = handle.emit("pipeline:error", e.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    });
+                    return;
+                }
                 let hotkey_mode = handle
                     .state::<HotkeyModeCache>()
                     .0
@@ -62,8 +93,10 @@ pub fn build_shortcut_handler(
                 spawn_press(handle, hotkey_mode);
             }
             ShortcutState::Released => {
-                // Escape's release must not be treated as a hold-mode stop.
-                if shortcut.key == Code::Escape && shortcut.mods.is_empty() {
+                // Escape's / Return's release must not be treated as a hold-mode stop.
+                if (shortcut.key == Code::Escape || shortcut.key == Code::Enter)
+                    && shortcut.mods.is_empty()
+                {
                     return;
                 }
                 let hotkey_mode = handle
@@ -93,8 +126,10 @@ pub fn spawn_press(handle: tauri::AppHandle, hotkey_mode: String) {
     tauri::async_runtime::spawn(async move {
         let pipeline = handle.state::<pipeline::PipelineHandle>();
 
-        // In preview, the hotkey confirms & sends the previewed text.
+        // In preview, the hotkey confirms & sends the previewed text. Finalizing
+        // with the hotkey (rather than Return) means "send, no trailing Enter".
         if pipeline.current_state() == pipeline::PipelineState::Previewing {
+            pipeline.set_append_enter_override(false);
             if let Err(e) = pipeline.confirm_preview().await {
                 tracing::error!("Failed to confirm preview: {}", e);
                 let _ = handle.emit("pipeline:error", e.to_string());
@@ -110,6 +145,8 @@ pub fn spawn_press(handle: tauri::AppHandle, hotkey_mode: String) {
         if state == pipeline::PipelineState::Transcribing
             || state == pipeline::PipelineState::Polishing
         {
+            // Finalizing with the hotkey means "send directly, no trailing Enter".
+            pipeline.set_append_enter_override(false);
             pipeline.request_skip_preview();
             return;
         }

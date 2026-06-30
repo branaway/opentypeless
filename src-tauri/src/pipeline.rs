@@ -559,6 +559,11 @@ pub struct PipelineHandle {
     /// hotkey press), the in-flight result skips the editable preview and is
     /// output directly. Reset at the start of every recording and after use.
     skip_preview_once: Arc<AtomicBool>,
+    /// Per-run override for the trailing-Enter behavior, encoding which key the
+    /// user finalized with: 0 = unset (fall back to config.output_append_enter),
+    /// 1 = force ON (finalized with Return → send + Enter), 2 = force OFF
+    /// (finalized with the hotkey → send, no Enter). Reset at each recording start.
+    append_enter_override: Arc<AtomicU8>,
     /// Cached `sound_effects_enabled` setting, refreshed at the start of every
     /// recording so the early state beeps (which fire before config is loaded
     /// in stop()) can be gated without a config read on the hot path.
@@ -598,6 +603,7 @@ impl PipelineHandle {
             preloaded_selected_text: Arc::new(Mutex::new(None)),
             recording_start: Arc::new(Mutex::new(None)),
             skip_preview_once: Arc::new(AtomicBool::new(false)),
+            append_enter_override: Arc::new(AtomicU8::new(0)),
             sound_enabled: Arc::new(AtomicBool::new(true)),
             preview_text: Arc::new(Mutex::new(String::new())),
             preview_caret: Arc::new(AtomicUsize::new(usize::MAX)),
@@ -612,10 +618,13 @@ impl PipelineHandle {
         self.state.store(new_state.as_u8(), Ordering::SeqCst);
         let _ = self.app_handle.emit("pipeline:state", new_state);
 
-        // Returning to Idle ends the session — release the global Escape grab.
-        // Every terminal path (stop, abort, no-speech, confirm/cancel preview)
-        // funnels through here, so this is the single cleanup point.
-        if new_state == PipelineState::Idle {
+        // Release the global Escape/Return grab once the session leaves the
+        // interceptable states. This MUST happen before Outputting, not just at
+        // Idle: output synthesizes a trailing Enter (append-enter), and if our
+        // global Return shortcut were still registered it would swallow our own
+        // synthesized keystroke before it reached the target app. Both Idle
+        // (every terminal path) and Outputting funnel through here.
+        if new_state == PipelineState::Idle || new_state == PipelineState::Outputting {
             self.unregister_escape();
         }
 
@@ -648,16 +657,34 @@ impl PipelineHandle {
     /// Best-effort: failure just means Escape won't be intercepted.
     fn register_escape(&self) {
         use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
-        let esc = Shortcut::new(None, Code::Escape);
-        if let Err(e) = self.app_handle.global_shortcut().register(esc) {
+        if let Err(e) = self
+            .app_handle
+            .global_shortcut()
+            .register(Shortcut::new(None, Code::Escape))
+        {
             tracing::warn!("Failed to register Escape shortcut: {}", e);
+        }
+        // Return is grabbed for the same session window so it can finalize the
+        // run with a trailing Enter from any active state.
+        if let Err(e) = self
+            .app_handle
+            .global_shortcut()
+            .register(Shortcut::new(None, Code::Enter))
+        {
+            tracing::warn!("Failed to register Return shortcut: {}", e);
         }
     }
 
     fn unregister_escape(&self) {
         use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
-        let esc = Shortcut::new(None, Code::Escape);
-        let _ = self.app_handle.global_shortcut().unregister(esc);
+        let _ = self
+            .app_handle
+            .global_shortcut()
+            .unregister(Shortcut::new(None, Code::Escape));
+        let _ = self
+            .app_handle
+            .global_shortcut()
+            .unregister(Shortcut::new(None, Code::Enter));
     }
 
     /// Play a state-transition audio cue, unless the user has disabled sound
@@ -679,6 +706,34 @@ impl PipelineHandle {
             let _ = self.app_handle.emit("preview:skip-armed", true);
             tracing::info!("Skip-preview armed; result will be output directly");
         }
+    }
+
+    /// Record which key finalized this run, setting the trailing-Enter intent:
+    /// `true` (Return → send + Enter) or `false` (hotkey → send, no Enter). The
+    /// intent is latched now and read when the pipeline reaches output, so the
+    /// user can press at any point during Transcribing/Polishing/Previewing.
+    pub fn set_append_enter_override(&self, append_enter: bool) {
+        self.append_enter_override
+            .store(if append_enter { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Resolve whether to append a trailing Enter for this run: the per-run key
+    /// override if set, otherwise the global config default.
+    fn resolve_append_enter(&self, config: &storage::AppConfig) -> bool {
+        match self.append_enter_override.load(Ordering::SeqCst) {
+            1 => true,
+            2 => false,
+            _ => config.output_append_enter,
+        }
+    }
+
+    /// Unconditionally arm the one-shot skip-preview flag so the in-flight (or
+    /// next) result is output directly. Used by the Return finalize path while
+    /// still Recording, where `request_skip_preview` (which guards on
+    /// Transcribing/Polishing) would be a no-op.
+    pub fn arm_skip_preview(&self) {
+        self.skip_preview_once.store(true, Ordering::SeqCst);
+        let _ = self.app_handle.emit("preview:skip-armed", true);
     }
 
     /// Immediately abort the pipeline regardless of current state.
@@ -804,6 +859,8 @@ impl PipelineHandle {
         self.abort_flag.store(false, Ordering::SeqCst);
         // Clear any stale skip-preview request from a previous run.
         self.skip_preview_once.store(false, Ordering::SeqCst);
+        // Clear any stale trailing-Enter override; each run decides afresh.
+        self.append_enter_override.store(0, Ordering::SeqCst);
 
         // Atomic CAS: only one caller can transition Idle → Recording
         if self
@@ -1502,6 +1559,12 @@ impl PipelineHandle {
 
         // ── Phase 3: output, timing, history, cleanup ──────────────────
         self.play_sound(crate::sound::Cue::Output);
+        // Restore focus to the app that was frontmost when recording started, in
+        // case the user switched apps while waiting for transcription — otherwise
+        // the simulated paste/keystrokes land in whatever is now focused. Mirrors
+        // confirm_preview()'s reactivate step. Note: this is app/process-level
+        // only — it cannot return to a specific tab within the same terminal app.
+        tokio::task::block_in_place(|| reactivate_app(&app_ctx.app_name));
         let prefer_paste = app_ctx.app_type == crate::llm::AppType::Terminal;
         if let Err(e) = self
             .output_text(&final_text, &app_ctx.app_name, &config, prefer_paste)
@@ -2016,7 +2079,7 @@ impl PipelineHandle {
         // Optionally submit the output with a trailing Enter (e.g. run the
         // command in a terminal) so the user doesn't press it manually. Output
         // already landed, so a failure here is logged but not fatal.
-        if config.output_append_enter {
+        if self.resolve_append_enter(config) {
             tokio::time::sleep(std::time::Duration::from_millis(APPEND_ENTER_DELAY_MS)).await;
             match tokio::task::spawn_blocking(output::press_enter).await {
                 Ok(Ok(())) => {}

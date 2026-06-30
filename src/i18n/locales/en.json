@@ -25,8 +25,9 @@
     "output_wayland_clipboard_copy_only": "Copied to clipboard. Paste manually on Wayland."
   },
   "home": {
-    "welcome": "Welcome to OpenTypeless",
+    "welcome": "Welcome to {{name}}",
     "description": "Hold {{hotkey}} to start voice recording. Your speech will be transcribed and optionally polished by AI.",
+    "descriptionTap": "Tap {{hotkey}} to start, then tap again to stop. Your speech is transcribed and optionally polished by AI.",
     "totalRecordings": "Total Recordings",
     "today": "Today",
     "proPlan": "Pro Plan",
@@ -292,6 +293,7 @@
     "selectedTextContextDesc": "When enabled, the selected text in the foreground app will be captured via simulated Ctrl+C and sent to the LLM as context.",
     "targetLanguage": "Target Language",
     "aboutDescription": "Open-source AI voice input tool. Speak to write — turn your voice into polished text in real time.",
+    "builtAt": "Built {{time}}",
     "openSource": "Open Source",
     "license": "License",
     "mit": "MIT",

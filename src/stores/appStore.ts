@@ -120,6 +120,10 @@ interface AppState {
   appendPolishedChunk: (chunk: string) => void
   recordingDuration: number
   setRecordingDuration: (d: number) => void
+  // Cumulative characters received so far from the streaming transcribe response;
+  // drives the live progress bar in the Transcribing capsule. 0 between runs.
+  transcribeChars: number
+  setTranscribeChars: (n: number) => void
   targetApp: string
   setTargetApp: (app: string) => void
 
@@ -261,6 +265,8 @@ export const useAppStore = create<AppState>((set) => ({
   appendPolishedChunk: (chunk) => set((s) => ({ polishedText: s.polishedText + chunk })),
   recordingDuration: 0,
   setRecordingDuration: (recordingDuration) => set({ recordingDuration }),
+  transcribeChars: 0,
+  setTranscribeChars: (transcribeChars) => set({ transcribeChars }),
   targetApp: '',
   setTargetApp: (targetApp) => set({ targetApp }),
 
@@ -336,6 +342,7 @@ export const useAppStore = create<AppState>((set) => ({
       finalTranscript: '',
       polishedText: '',
       recordingDuration: 0,
+      transcribeChars: 0,
     }),
 
   savedConfig: null,

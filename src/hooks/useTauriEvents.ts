@@ -22,6 +22,7 @@ export function useTauriEvents() {
     setPreviewListening,
     setPreviewThinking,
     setPreviewSkipArmed,
+    setTranscribeChars,
     setPipelineError,
     setAccessibilityTrusted,
     setHistory,
@@ -58,6 +59,10 @@ export function useTauriEvents() {
         setPipelineError(null)
         setPreviewSkipArmed(false)
       }
+      if (state === 'transcribing') {
+        // Reset the live transcribe progress at the start of each transcription.
+        setTranscribeChars(0)
+      }
       if (state === 'idle') {
         setPreviewSkipArmed(false)
         // Don't clear pipelineError here — CapsuleError auto-resets after 2.5s.
@@ -70,6 +75,7 @@ export function useTauriEvents() {
           })
       }
     })
+    addListener<number>('transcribe:progress', setTranscribeChars)
     addListener<string>('pipeline:target_app', setTargetApp)
     addListener<string>('preview:ready', setPreviewText)
     addListener<number>('preview:caret', setPreviewCaret)
@@ -131,6 +137,7 @@ export function useTauriEvents() {
     setPreviewListening,
     setPreviewThinking,
     setPreviewSkipArmed,
+    setTranscribeChars,
     setPipelineError,
     setAccessibilityTrusted,
     setHistory,

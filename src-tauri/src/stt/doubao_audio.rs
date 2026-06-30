@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use crate::error::AppError;
 
@@ -33,6 +33,239 @@ fn record_usage(app_handle: &tauri::AppHandle, data: &serde_json::Value, model: 
     if let Some(store) = app_handle.try_state::<crate::storage::UsageStore>() {
         store.record(model, kind, audio, text_in, output);
     }
+}
+
+/// Low-latency service tier. The Doubao/ARK backend serves requests faster when
+/// `service_tier: "fast"` is set explicitly (the default `auto` does not use it).
+const SERVICE_TIER_FAST: &str = "fast";
+
+/// Once the "fast" tier is seen to be unavailable on this account — either the
+/// request is rejected for it, or the response comes back on a different tier —
+/// we stop asking for it so the user falls back seamlessly to normal latency.
+/// Process-wide and best-effort; it resets on the next app launch.
+static FAST_TIER_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn fast_tier_enabled() -> bool {
+    !FAST_TIER_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn disable_fast_tier(reason: &str) {
+    if !FAST_TIER_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "Doubao low-latency '{}' tier unavailable ({}); using normal latency for the rest of this session",
+            SERVICE_TIER_FAST,
+            reason
+        );
+    }
+}
+
+/// Validate the HTTP status of a chat/completions response, mapping the well-known
+/// error codes. Returns `Ok(())` on success so the caller can parse the body.
+fn check_chat_status(status: u16) -> Result<(), AppError> {
+    if status == 401 || status == 403 {
+        return Err(AppError::Auth(format!(
+            "Doubao audio API key rejected (HTTP {})",
+            status
+        )));
+    }
+    if status == 429 {
+        return Err(AppError::Quota(
+            "Doubao audio API quota exceeded".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// POST a chat/completions request, opting into the low-latency `fast` tier when
+/// it's still believed to work. If the backend rejects the tier (HTTP 400 citing
+/// `service_tier`), it's disabled and the request is retried once without it so
+/// the user still gets a result. A silent downgrade (response served on another
+/// tier) also disables it for future requests. `body` must NOT already contain a
+/// `service_tier` key. Returns the parsed JSON response.
+async fn post_chat_completions(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    mut body: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, AppError> {
+    let use_fast = fast_tier_enabled();
+    if use_fast {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "service_tier".to_string(),
+                serde_json::Value::from(SERVICE_TIER_FAST),
+            );
+        }
+    }
+
+    let res = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Network(e.to_string()))?;
+
+    let status = res.status().as_u16();
+    check_chat_status(status)?;
+
+    if !res.status().is_success() {
+        let body_text = res.text().await.unwrap_or_default();
+        // If the fast tier was the problem, drop it and retry once so the user
+        // transparently falls back to normal latency.
+        if use_fast && status == 400 && body_text.to_lowercase().contains("service_tier") {
+            disable_fast_tier("request rejected");
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("service_tier");
+            }
+            return Box::pin(post_chat_completions(
+                client,
+                url,
+                api_key,
+                body,
+                timeout_secs,
+            ))
+            .await;
+        }
+        return Err(AppError::Api {
+            status,
+            body: body_text[..body_text.len().min(300)].to_string(),
+        });
+    }
+
+    let data: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::Network(format!("Doubao audio response parse error: {}", e)))?;
+
+    // Detect a silent downgrade: we asked for fast but were served another tier.
+    if use_fast {
+        if let Some(tier) = data.get("service_tier").and_then(|v| v.as_str()) {
+            if tier != SERVICE_TIER_FAST {
+                disable_fast_tier(&format!("served on '{}'", tier));
+            }
+        }
+    }
+
+    Ok(data)
+}
+
+/// Streaming variant of [`post_chat_completions`] used for the main transcribe
+/// call. Same fast-tier opt-in and 400 fallback, but it reads the SSE stream and
+/// pulses `transcribe:progress` (cumulative char count) to the frontend on every
+/// content delta, so the capsule can show a real, response-driven progress bar.
+/// The call is still effectively one-shot — we accumulate and return the full
+/// text — streaming only provides the liveness signal. Returns (content, usage).
+async fn stream_chat_completions(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    mut body: serde_json::Value,
+    timeout_secs: u64,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<(String, Option<serde_json::Value>), AppError> {
+    use futures_util::StreamExt;
+
+    let use_fast = fast_tier_enabled();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+        // Ask the backend to include the usage block in the final stream chunk —
+        // otherwise streamed responses omit it and we'd lose cost accounting.
+        obj.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "include_usage": true }),
+        );
+        if use_fast {
+            obj.insert(
+                "service_tier".to_string(),
+                serde_json::Value::from(SERVICE_TIER_FAST),
+            );
+        }
+    }
+
+    let res = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Network(e.to_string()))?;
+
+    let status = res.status().as_u16();
+    check_chat_status(status)?;
+
+    if !res.status().is_success() {
+        let body_text = res.text().await.unwrap_or_default();
+        if use_fast && status == 400 && body_text.to_lowercase().contains("service_tier") {
+            disable_fast_tier("request rejected");
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("service_tier");
+            }
+            return Box::pin(stream_chat_completions(
+                client,
+                url,
+                api_key,
+                body,
+                timeout_secs,
+                app_handle,
+            ))
+            .await;
+        }
+        return Err(AppError::Api {
+            status,
+            body: body_text[..body_text.len().min(300)].to_string(),
+        });
+    }
+
+    let mut stream = res.bytes_stream();
+    let mut buffer = String::new();
+    let mut content = String::new();
+    let mut usage: Option<serde_json::Value> = None;
+
+    // Signal the start so the bar leaves 0 immediately, before the first token.
+    if let Some(h) = app_handle {
+        let _ = h.emit("transcribe:progress", 0usize);
+    }
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::Network(e.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim().to_string();
+            buffer = buffer[line_end + 1..].to_string();
+
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                if !c.is_empty() {
+                    content.push_str(c);
+                    if let Some(h) = app_handle {
+                        let _ = h.emit("transcribe:progress", content.chars().count());
+                    }
+                }
+            }
+            // The final chunk (choices empty) carries the usage block.
+            if v.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
+                usage = Some(v["usage"].clone());
+            }
+        }
+    }
+
+    Ok((content, usage))
 }
 
 pub const DOUBAO_AUDIO_PROVIDER: &str = "doubao-audio";
@@ -269,41 +502,7 @@ pub async fn run_edit_action(
     });
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-
-    let res = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(60))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Network(e.to_string()))?;
-
-    let status = res.status().as_u16();
-    if status == 401 || status == 403 {
-        return Err(AppError::Auth(format!(
-            "Doubao audio API key rejected (HTTP {})",
-            status
-        )));
-    }
-    if status == 429 {
-        return Err(AppError::Quota(
-            "Doubao audio API quota exceeded".to_string(),
-        ));
-    }
-    if !res.status().is_success() {
-        let body_text = res.text().await.unwrap_or_default();
-        return Err(AppError::Api {
-            status,
-            body: body_text[..body_text.len().min(300)].to_string(),
-        });
-    }
-
-    let data: serde_json::Value = res
-        .json()
-        .await
-        .map_err(|e| AppError::Network(format!("Doubao audio response parse error: {}", e)))?;
+    let data = post_chat_completions(client, &url, api_key, body, 60).await?;
 
     record_usage(app_handle, &data, model, "edit");
 
@@ -393,52 +592,23 @@ impl SttProvider for DoubaoAudioProvider {
         });
 
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-
-        let res = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", cfg.api_key))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(90))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::Network(e.to_string()))?;
-
-        let status = res.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(AppError::Auth(format!(
-                "Doubao audio API key rejected (HTTP {})",
-                status
-            )));
-        }
-        if status == 429 {
-            return Err(AppError::Quota(
-                "Doubao audio API quota exceeded".to_string(),
-            ));
-        }
-        if !res.status().is_success() {
-            let body_text = res.text().await.unwrap_or_default();
-            return Err(AppError::Api {
-                status,
-                body: body_text[..body_text.len().min(300)].to_string(),
-            });
-        }
-
-        let data: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| AppError::Network(format!("Doubao audio response parse error: {}", e)))?;
+        let (content, usage) = stream_chat_completions(
+            &self.client,
+            &url,
+            &cfg.api_key,
+            body,
+            90,
+            cfg.app_handle.as_ref(),
+        )
+        .await?;
 
         if let Some(ref h) = cfg.app_handle {
+            // record_usage reads `data["usage"]`, so rewrap the streamed usage.
+            let data = serde_json::json!({ "usage": usage });
             record_usage(h, &data, &cfg.model, "transcribe");
         }
 
-        let text = data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let text = content.trim().to_string();
 
         tracing::info!("[DoubaoAudio] Got {} chars of polished text", text.len());
         Ok(Some(text))

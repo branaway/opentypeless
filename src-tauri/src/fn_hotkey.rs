@@ -35,6 +35,37 @@ extern "C" {
     fn CGEventTapEnable(tap: *const c_void, enable: bool);
 }
 
+/// macOS Input Monitoring (IOHID "listen") permission. A keyboard `CGEventTap`
+/// only receives *global* events when this is granted; without it the tap is
+/// created successfully but only sees events while our own app is frontmost —
+/// so the Fn trigger appears dead in every other app. This is a *separate*
+/// permission from Accessibility, and nothing else in the app requests it, so
+/// the app would never even show up in the Input Monitoring list.
+mod input_monitoring {
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOHIDCheckAccess(request: u32) -> u32;
+        fn IOHIDRequestAccess(request: u32) -> bool;
+    }
+
+    // IOHIDRequestType: listen to events (monitoring), as opposed to posting.
+    const REQUEST_TYPE_LISTEN_EVENT: u32 = 1;
+    // IOHIDAccessType::granted.
+    const ACCESS_TYPE_GRANTED: u32 = 0;
+
+    /// True if Input Monitoring is already granted to this app.
+    pub fn is_granted() -> bool {
+        unsafe { IOHIDCheckAccess(REQUEST_TYPE_LISTEN_EVENT) == ACCESS_TYPE_GRANTED }
+    }
+
+    /// Trigger the system Input Monitoring prompt (and register the app in the
+    /// Privacy list). Returns true if access is granted. Safe to call repeatedly;
+    /// the OS only shows the prompt once.
+    pub fn request() -> bool {
+        unsafe { IOHIDRequestAccess(REQUEST_TYPE_LISTEN_EVENT) }
+    }
+}
+
 /// Modifier flags that, if present alongside Fn, mean the user is using Fn as a
 /// real modifier (e.g. Fn+Shift) rather than tapping it on its own.
 const OTHER_MODS: CGEventFlags = CGEventFlags::from_bits_truncate(
@@ -67,6 +98,25 @@ pub fn spawn(app_handle: tauri::AppHandle) {
 
 fn run(app_handle: tauri::AppHandle) {
     tracing::info!("fn-hotkey: thread started, creating event tap…");
+
+    // A keyboard event tap needs Input Monitoring to see events globally. Without
+    // it the Fn trigger only fires while our own window is frontmost, which looks
+    // like "the hotkey does nothing in other apps". Request it up front so the
+    // system prompt appears and the app is added to the Privacy list; if it's
+    // still not granted, point the user straight at the right settings pane.
+    if !input_monitoring::is_granted() {
+        tracing::warn!("Input Monitoring not granted; requesting access for the Fn trigger…");
+        if !input_monitoring::request() {
+            tracing::warn!(
+                "Input Monitoring still not granted — the Fn trigger will only work while \
+                 MyTypeless is frontmost until it is enabled in System Settings → Privacy & \
+                 Security → Input Monitoring (a restart may be needed after enabling)."
+            );
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+                .spawn();
+        }
+    }
     let state = Arc::new(Mutex::new(TapState {
         fn_down: false,
         press_at: None,

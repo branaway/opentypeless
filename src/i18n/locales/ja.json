@@ -25,7 +25,7 @@
     "output_wayland_clipboard_copy_only": "Copied to clipboard. Paste manually on Wayland."
   },
   "home": {
-    "welcome": "OpenTypelessへようこそ",
+    "welcome": "{{name}}へようこそ",
     "description": "{{hotkey}}を長押しして音声録音を開始します。音声が文字起こしされ、AIによる整形が行われます。",
     "totalRecordings": "総録音回数",
     "today": "今日",

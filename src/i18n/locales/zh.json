@@ -25,8 +25,9 @@
     "output_wayland_clipboard_copy_only": "已复制到剪贴板。Wayland 下需要手动粘贴。"
   },
   "home": {
-    "welcome": "欢迎使用 OpenTypeless",
+    "welcome": "欢迎使用 {{name}}",
     "description": "按住 {{hotkey}} 开始语音录制。语音将被转录并可选择由 AI 润色。",
+    "descriptionTap": "轻点 {{hotkey}} 开始，再点一次停止。语音将被转录并可选择由 AI 润色。",
     "totalRecordings": "总录音数",
     "today": "今日",
     "proPlan": "Pro 计划",
@@ -292,6 +293,7 @@
     "selectedTextContextDesc": "启用后，前台应用中选中的文本将通过模拟 Ctrl+C 捕获，并作为上下文发送给 LLM。",
     "targetLanguage": "目标语言",
     "aboutDescription": "开源 AI 语音输入工具。说话即写作 — 实时将语音转化为润色文本。",
+    "builtAt": "构建于 {{time}}",
     "openSource": "开源",
     "license": "许可证",
     "mit": "MIT",

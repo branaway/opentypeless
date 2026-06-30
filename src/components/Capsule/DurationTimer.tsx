@@ -15,6 +15,7 @@ export function DurationTimer() {
   const pipelineState = useAppStore((s) => s.pipelineState)
   const maxSeconds = useAppStore((s) => s.config.max_recording_seconds)
   const setRecordingProgress = useAppStore((s) => s.setRecordingProgress)
+  const setRecordingDuration = useAppStore((s) => s.setRecordingDuration)
   // Seconds of actual speech (silence excluded) — this is what the cap applies to.
   const [voiced, setVoiced] = useState(0)
   const voicedRef = useRef(0)
@@ -23,6 +24,12 @@ export function DurationTimer() {
 
   useEffect(() => {
     if (pipelineState !== 'recording') {
+      // Stash the voiced seconds just recorded so the Transcribing progress bar
+      // can estimate how much text to expect. Only when we actually captured
+      // something — don't clobber it with 0 on unrelated state changes.
+      if (voicedRef.current > 0) {
+        setRecordingDuration(voicedRef.current)
+      }
       setVoiced(0)
       voicedRef.current = 0
       wallRef.current = 0
@@ -50,7 +57,7 @@ export function DurationTimer() {
       }
     }, TICK_MS)
     return () => clearInterval(interval)
-  }, [pipelineState, maxSeconds, setRecordingProgress])
+  }, [pipelineState, maxSeconds, setRecordingProgress, setRecordingDuration])
 
   const total = Math.floor(voiced)
   const mm = String(Math.floor(total / 60)).padStart(2, '0')

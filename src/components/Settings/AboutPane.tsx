@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import i18n from '../../i18n'
@@ -10,6 +11,13 @@ export function AboutPane() {
   const { t } = useTranslation()
   const config = useAppStore((s) => s.config)
   const updateConfig = useAppStore((s) => s.updateConfig)
+  const [buildTime, setBuildTime] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<string | null>('get_build_time')
+      .then((value) => setBuildTime(value))
+      .catch(() => setBuildTime(null))
+  }, [])
 
   const currentLang = config.ui_language || i18n.language || 'en'
 
@@ -26,6 +34,11 @@ export function AboutPane() {
       <div className="text-center py-6">
         <h2 className="text-[22px] font-semibold text-text-primary">{APP_NAME}</h2>
         <p className="text-text-secondary mt-1 text-[13px]">{APP_VERSION}</p>
+        {buildTime && (
+          <p className="text-text-tertiary mt-0.5 text-[11px]">
+            {t('settings.builtAt', { time: buildTime })}
+          </p>
+        )}
       </div>
 
       <p className="text-text-secondary leading-relaxed">{t('settings.aboutDescription')}</p>

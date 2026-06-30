@@ -538,6 +538,7 @@ pub fn run() {
             commands::misc::resume_hotkey,
             commands::misc::refresh_tray_labels,
             commands::misc::get_platform_capabilities,
+            commands::misc::get_build_time,
             commands::misc::get_hotkey_registration_error,
             commands::config::set_auto_start,
             commands::config::set_capsule_auto_hide,

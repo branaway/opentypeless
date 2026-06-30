@@ -2,7 +2,8 @@ import { Mic, Settings, History, Crown } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 import { spring } from '../../lib/animations'
-import { useAppStore } from '../../stores/appStore'
+import { APP_NAME } from '../../lib/constants'
+import { isMacPlatform, useAppStore } from '../../stores/appStore'
 import { hasManagedCloudAccess, useAuthStore } from '../../stores/authStore'
 import { useRoute } from '../../lib/router'
 
@@ -22,6 +23,10 @@ export function HomePage() {
   } = useAuthStore()
   const { t } = useTranslation()
   const hasCloudAccess = useAuthStore(hasManagedCloudAccess)
+  const platformOs = useAppStore((s) => s.platformCapabilities?.os)
+  // macOS triggers via a single Fn / 🌐 key tap (the CGEventTap), not the
+  // configurable hold-hotkey used on Windows/Linux — reflect that here.
+  const isMac = platformOs ? platformOs === 'macos' : isMacPlatform()
 
   const now = new Date()
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
@@ -40,10 +45,12 @@ export function HomePage() {
           >
             <Mic size={18} className="text-text-secondary" />
           </div>
-          <h2 className="text-[17px] font-semibold">{t('home.welcome')}</h2>
+          <h2 className="text-[17px] font-semibold">{t('home.welcome', { name: APP_NAME })}</h2>
         </div>
         <p className="text-[13px] text-text-secondary leading-relaxed">
-          {t('home.description', { hotkey: config.hotkey })}
+          {isMac
+            ? t('home.descriptionTap', { hotkey: 'Fn (🌐)' })
+            : t('home.description', { hotkey: config.hotkey })}
         </p>
       </div>
 

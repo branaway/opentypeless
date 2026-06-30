@@ -26,6 +26,18 @@ pub fn get_platform_capabilities() -> platform::PlatformCapabilities {
     platform::capabilities()
 }
 
+/// Build time of the running binary, derived from the executable file's
+/// modification timestamp (genuinely reflects when *this* build was produced,
+/// without any build-script caching caveats). Returned as a local-time string
+/// like "2026-06-30 11:42", or None if it can't be determined.
+#[tauri::command]
+pub fn get_build_time() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+    let datetime: chrono::DateTime<chrono::Local> = modified.into();
+    Some(datetime.format("%Y-%m-%d %H:%M").to_string())
+}
+
 #[tauri::command]
 pub fn get_hotkey_registration_error(
     state: tauri::State<'_, HotkeyRegistrationError>,
