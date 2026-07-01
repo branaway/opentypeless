@@ -875,6 +875,12 @@ impl PipelineHandle {
         {
             return Ok(());
         }
+        // Follow the user's actual focus: move the capsule to the monitor of
+        // whichever window they're dictating into, not wherever it last sat.
+        // Must happen before the state event fires so the frontend's own
+        // repositioning (driven by pipelineState changes) sees the capsule
+        // window already on the right monitor.
+        crate::capsule::reposition_to_focused_window(&self.app_handle);
         let _ = self
             .app_handle
             .emit("pipeline:state", PipelineState::Recording);

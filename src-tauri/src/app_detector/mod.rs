@@ -19,6 +19,94 @@ impl Default for AppContext {
     }
 }
 
+/// The frontmost window's on-screen frame, used to figure out which monitor
+/// the user is actually looking at (not just where our own capsule window
+/// happens to sit). `physical` indicates whether x/y/width/height are in
+/// physical pixels (Windows) or logical points (macOS, via the Accessibility
+/// API) so callers can compare against the right coordinate space.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowFrame {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub physical: bool,
+}
+
+pub fn focused_window_frame() -> Option<WindowFrame> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_focused_window_frame()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_focused_window_frame()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_focused_window_frame() -> Option<WindowFrame> {
+    use std::process::Command;
+
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            r#"tell application "System Events"
+            set frontApp to first application process whose frontmost is true
+            try
+                set winPos to position of front window of frontApp
+                set winSize to size of front window of frontApp
+                return (item 1 of winPos as string) & "," & (item 2 of winPos as string) & "," & (item 1 of winSize as string) & "," & (item 2 of winSize as string)
+            on error
+                return ""
+            end try
+        end tell"#,
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let parts: Vec<f64> = text
+        .trim()
+        .split(',')
+        .filter_map(|p| p.trim().parse::<f64>().ok())
+        .collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some(WindowFrame {
+        x: parts[0],
+        y: parts[1],
+        width: parts[2],
+        height: parts[3],
+        physical: false,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_focused_window_frame() -> Option<WindowFrame> {
+    unsafe {
+        let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        Some(WindowFrame {
+            x: rect.left as f64,
+            y: rect.top as f64,
+            width: (rect.right - rect.left) as f64,
+            height: (rect.bottom - rect.top) as f64,
+            physical: true,
+        })
+    }
+}
+
 pub fn detect_current_app() -> AppContext {
     #[cfg(target_os = "windows")]
     {

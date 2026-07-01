@@ -107,15 +107,21 @@ export function useCapsuleResize() {
           await win.setFocusable(getCapsuleFocusable()).catch(() => {})
 
           if (!initialized.current) {
-            // First mount: position at bottom-center of screen, then show
+            // First mount: position on the monitor the capsule window actually
+            // ends up on (which tracks wherever the OS opens it, typically near
+            // the user's active window/focus), not always the OS-designated
+            // primary monitor.
             await win.setSize(new LogicalSize(windowWidth, windowHeight)).catch(() => {})
             try {
               const monitor = await resolveMonitor()
               if (monitor) {
-                const sw = monitor.size.width / monitor.scaleFactor
-                const sh = monitor.size.height / monitor.scaleFactor
-                const x = Math.round(sw / 2 - windowWidth / 2)
-                const y = Math.round(sh - windowHeight - 80)
+                const scale = monitor.scaleFactor
+                const monX = monitor.position.x / scale
+                const monY = monitor.position.y / scale
+                const sw = monitor.size.width / scale
+                const sh = monitor.size.height / scale
+                const x = monX + Math.round(sw / 2 - windowWidth / 2)
+                const y = monY + Math.round(sh - windowHeight - 80)
                 await win.setPosition(new LogicalPosition(x, y)).catch(() => {})
               }
             } catch {
@@ -155,10 +161,12 @@ export function useCapsuleResize() {
                 : Math.round(oldCenterX - windowWidth / 2)
               let newY = Math.round(oldBottomY - windowHeight)
               if (monitor) {
+                const monX = monitor.position.x / scale
+                const monY = monitor.position.y / scale
                 const sw = monitor.size.width / scale
                 const sh = monitor.size.height / scale
-                newX = Math.max(8, Math.min(newX, Math.round(sw - windowWidth - 8)))
-                newY = Math.max(8, Math.min(newY, Math.round(sh - windowHeight - 8)))
+                newX = Math.max(monX + 8, Math.min(newX, Math.round(monX + sw - windowWidth - 8)))
+                newY = Math.max(monY + 8, Math.min(newY, Math.round(monY + sh - windowHeight - 8)))
               }
               await win.setPosition(new LogicalPosition(newX, newY)).catch(() => {})
               await win.setSize(new LogicalSize(windowWidth, windowHeight)).catch(() => {})

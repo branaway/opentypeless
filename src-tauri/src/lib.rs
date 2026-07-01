@@ -1,5 +1,6 @@
 pub mod app_detector;
 pub mod audio;
+pub mod capsule;
 pub mod commands;
 pub mod error;
 #[cfg(target_os = "macos")]
